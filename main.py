@@ -1,8 +1,9 @@
 from __future__ import annotations
 import pypcode
 from z3 import *
-from typing import Callable
+from typing import Callable, Optional, Tuple
 from dataclasses import dataclass
+from minidump.minidumpfile import MinidumpFile
 
 BITS_PER_BYTE = 8
 
@@ -20,20 +21,46 @@ class Cpu:
         self.ctx = pypcode.Context("x86:LE:64:default")
         self.varnode_values = {}
 
+    def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
+        for reg_name, reg_varnode in self.ctx.registers.items():
+            if reg_varnode.space != addr.space:
+                continue
+            reg_start_off = reg_varnode.offset
+            reg_end_off = reg_start_off + reg_varnode.size
+            if addr.off >= reg_start_off and addr.off < reg_end_off:
+                return reg_name
+
+    def symbolize_register(self, reg_name: str):
+        reg_varnode = self.ctx.registers[reg_name]
+        var_name = 'orig_{}'.format(reg_name.lower())
+        var = BitVec(var_name, reg_varnode.size * BITS_PER_BYTE)
+        self.write_varnode(reg_varnode, var)
+
     def read_varnode_single_byte(self, addr: VarnodeAddr) -> ExprRef:
+        # simplify the address before trying to access the dictionary.
+        # this is important since simplification makes the expression deterministic.
         if addr in self.varnode_values:
             return self.varnode_values[addr]
         else:
-            var_name = '{}_{}'.format(addr.space.name, addr.off)
-            var = BitVec(var_name, 8)
-            self.write_varnode_single_byte(addr, var)
-            return var
+            # value is uninitialized, need to initialize it with a variable
+            reg_name = self.get_reg_name_containting_addr(addr)
+            if reg_name != None:
+                # value is a register, initialize the register and then read the specific byte
+                self.symbolize_register(reg_name)
+                return self.varnode_values[addr]
+            else:
+                # value is not a register, create a variable for this specific byte
+                var_name = '{}_{}'.format(addr.space.name, addr.off)
+                var = BitVec(var_name, 8)
+                self.write_varnode_single_byte(addr, var)
+                return var
 
     def read_non_const_multibyte_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
         single_byte_values = []
         for rel_byte_off in range(varnode.size):
             addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
             single_byte_values.append(self.read_varnode_single_byte(addr))
+        single_byte_values.reverse()
         return Concat(single_byte_values)
 
     def read_non_const_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
@@ -49,7 +76,8 @@ class Cpu:
         if varnode.space.name == 'const':
             return BitVecVal(varnode.offset, varnode.size * BITS_PER_BYTE)
         else:
-            return self.read_non_const_varnode(varnode)
+            x = self.read_non_const_varnode(varnode)
+            return simplify(self.read_non_const_varnode(varnode))
 
     def write_varnode_single_byte(self, addr: VarnodeAddr, value: ExprRef):
         assert value.size() == 8
@@ -57,8 +85,8 @@ class Cpu:
         
     def write_varnode(self, varnode: pypcode.Varnode, value: ExprRef):
         assert value.size() == varnode.size * BITS_PER_BYTE
+        value = simplify(value)
         for rel_byte_off in range(varnode.size):
-            print(varnode.size)
             addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
@@ -83,10 +111,12 @@ class Cpu:
         binops = {
             pypcode.OpCode.INT_XOR: lambda a,b: a ^ b,
             pypcode.OpCode.INT_AND: lambda a,b: a & b,
+            pypcode.OpCode.INT_ADD: lambda a,b: a + b,
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
             pypcode.OpCode.INT_EQUAL: lambda a,b: a == b,
+            pypcode.OpCode.INT_SCARRY: lambda a,b: Not(BVAddNoOverflow(a, b, True)),
         }
         if op.opcode == pypcode.OpCode.IMARK:
             # do nothing
@@ -98,7 +128,7 @@ class Cpu:
             input = self.read_varnode(op.inputs[0])
             desired_size = op.output.size * BITS_PER_BYTE
             bits = (Extract(i, i, input) for i in range(input.size()))
-            expanded_bits = (Concat(bit, BitVecVal(0, desired_size - 1)) for bit in bits)
+            expanded_bits = (Concat(BitVecVal(0, desired_size - 1), bit) for bit in bits)
             result = Sum(*expanded_bits)
             self.write_varnode(op.output, result)
         elif op.opcode in binops:
@@ -130,6 +160,6 @@ class CpuRegs:
     
 
 cpu = Cpu()
-cpu.exec(b"\x48\x35\x78\x56\x34\x12")  # xor rax, 0x12345678; ret
+cpu.exec(b"\x48\x35\x34\x12\x00\x00")
 print(cpu.regs.rax)
 # print(cpu.varnode_values)
