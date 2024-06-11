@@ -26,9 +26,17 @@ class MemAccess:
     addr: MemAddr
     size_in_bytes: int
 
-def bits_to_bytes_sage(bits_amount: int) -> int:
+def bits_to_bytes_safe(bits_amount: int) -> int:
     assert bits_amount % BITS_PER_BYTE == 0
     return bits_amount // BITS_PER_BYTE
+
+@dataclass(frozen=True)
+class ExecRes:
+    branched_to: Optional[ExprRef]
+
+@dataclass(frozen=True)
+class ExecPcodeOpRes:
+    branched_to: Optional[ExprRef]
 
 class Cpu:
     def __init__(self):
@@ -184,7 +192,7 @@ class Cpu:
             b = ZeroExt(a.size() - b.size(), b)
         return a << b
 
-    def exec_pcode_op(self, op: pypcode.PcodeOp):
+    def exec_pcode_op(self, op: pypcode.PcodeOp) -> ExecPcodeOpRes:
         binops = {
             pypcode.OpCode.INT_XOR: lambda a,b: a ^ b,
             pypcode.OpCode.INT_AND: lambda a,b: a & b,
@@ -195,13 +203,19 @@ class Cpu:
             pypcode.OpCode.INT_OR: lambda a,b: a | b,
             pypcode.OpCode.INT_RIGHT: Cpu.shift_right,
             pypcode.OpCode.INT_LEFT: Cpu.shift_left,
+            pypcode.OpCode.BOOL_OR: lambda a,b: a | b,
+            pypcode.OpCode.BOOL_XOR: lambda a,b: a ^ b,
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
+            pypcode.OpCode.INT_LESS: lambda a,b: ULT(a, b),
             pypcode.OpCode.INT_EQUAL: lambda a,b: a == b,
             pypcode.OpCode.INT_NOTEQUAL: lambda a,b: a != b,
             pypcode.OpCode.INT_SCARRY: lambda a,b: Not(BVAddNoOverflow(a, b, True)),
+            pypcode.OpCode.INT_CARRY: lambda a,b: Not(BVAddNoOverflow(a, b, False)),
+            pypcode.OpCode.INT_SBORROW: lambda a,b: Or(Not(BVSubNoUnderflow(a, b, True)), Not(BVSubNoOverflow(a, b))),
         }
+        branched_to = None
         if op.opcode == pypcode.OpCode.IMARK:
             # do nothing
             pass
@@ -260,6 +274,10 @@ class Cpu:
             expand_by_bytes_amount = op.output.size - op.inputs[0].size
             result = SignExt(expand_by_bytes_amount * BITS_PER_BYTE, value)
             self.write_varnode(op.output, result)
+        elif op.opcode == pypcode.OpCode.INT_2COMP:
+            assert len(op.inputs) == 1
+            value = self.read_varnode(op.inputs[0])
+            self.write_varnode(op.output, -value)
         elif op.opcode == pypcode.OpCode.INT_NEGATE:
             assert len(op.inputs) == 1
             value = self.read_varnode(op.inputs[0])
@@ -269,6 +287,28 @@ class Cpu:
             value = self.read_varnode(op.inputs[0])
             result = If(value == 0, BitVecVal(1, 8), BitVecVal(0, 8))
             self.write_varnode(op.output, result)
+        elif op.opcode == pypcode.OpCode.BRANCH:
+            assert len(op.inputs) == 1
+            addr_varnode = op.inputs[0]
+            assert addr_varnode.space.name == 'ram'
+            addr = addr_varnode.offset
+            branched_to = BitVecVal(addr, 64)
+        elif op.opcode == pypcode.OpCode.CBRANCH:
+            assert len(op.inputs) == 2
+            addr_varnode = op.inputs[0]
+            assert addr_varnode.space.name == 'ram'
+            addr = addr_varnode.offset
+            cond_expr = self.read_varnode(op.inputs[1])
+            if isinstance(cond_expr, BitVecNumRef):
+                cond = cond_expr.as_long()
+                assert cond == 0 or cond == 1
+                if cond != 0:
+                    branched_to = BitVecVal(addr, 64)
+                else:
+                    # the branch is not takes, do nothing
+                    pass
+            else:
+                raise Exception('unresolved condition')
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
@@ -277,14 +317,19 @@ class Cpu:
             self.exec_comparison(op, comparison)
         else:
             raise Exception('no handler for opcode {}'.format(op.opcode))
+        return ExecPcodeOpRes(branched_to)
 
-    def exec(self, code: bytes) -> int:
-        """
-        returns the length in bytes of the actual code executed
-        """
-        tx = self.ctx.translate(code)
-        for op in tx.ops:
-            self.exec_pcode_op(op)
+    def exec_single_insn(self, code: bytes, base_addr: int) -> ExecRes:
+        tx = self.ctx.translate(code,base_address=base_addr)
+        branched_to = None
+        for i, op in enumerate(tx.ops):
+            res = self.exec_pcode_op(op)
+            if res.branched_to != None:
+                branched_to = res.branched_to
+                # make sure that this is the last pcode insn
+                assert i + 1 == len(tx.ops)
+                break
+        return ExecRes(branched_to)
 
     @property
     def regs(self) -> CpuRegs:
@@ -311,15 +356,19 @@ def exec_dump_file():
         insn_bytes = dump_reader.read(cur_addr, X86_MAX_INSN_LEN)
         insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, cur_addr))
 
-        print('executing insn {} {}'.format(insn_mnemonic, insn_op_str))
+        print('executing insn {} {} {}'.format(hex(cur_addr), insn_mnemonic, insn_op_str))
 
-        cpu.exec(insn_bytes[:insn_size])
+        res = cpu.exec_single_insn(insn_bytes[:insn_size], cur_addr)
 
-        cur_addr += insn_size
+        if res.branched_to != None:
+            assert isinstance(res.branched_to, BitVecNumRef)
+            cur_addr = res.branched_to.as_long()
+        else:
+            cur_addr += insn_size
 
 def quick():
     cpu = Cpu()
-    cpu.exec(b"\x50\x48\x31\x1C\x24\x59")
+    cpu.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59")
     print(cpu.regs.rcx)
 
 # quick()
