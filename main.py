@@ -74,6 +74,7 @@ class Cpu:
         self.ctx = pypcode.Context("x86:LE:64:default")
         self.varnode_values = {}
         self.mem_values = {}
+        self.mem_var_addresses = []
 
     def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
         for reg_name, reg_varnode in self.ctx.registers.items():
@@ -143,7 +144,10 @@ class Cpu:
             return self.mem_values[addr]
         else:
             # value is uninitialized, need to initialize it with a variable
-            var_name = 'orig_mem_{}[{}]'.format(addr.space_id, addr.offset)
+            # var_name = 'orig_mem_{}[{}]'.format(addr.space_id, addr.offset)
+            mem_var_id = len(self.mem_var_addresses)
+            var_name = 'orig_mem_{}'.format(mem_var_id)
+            self.mem_var_addresses.append(addr)
             var = BitVec(var_name, 8)
             self.write_mem_single_byte(addr, var)
             return var
