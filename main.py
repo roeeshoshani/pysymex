@@ -168,6 +168,22 @@ class Cpu:
         result = If(cond, BitVecVal(1, 8), BitVecVal(0, 8))
         self.write_varnode(op.output, result)
 
+    @staticmethod
+    def shift_right(a: ExprRef, b: ExprRef) -> ExprRef:
+        if b.size() > a.size():
+            b = Extract(a.size() - 1, 0, b)
+        if b.size() < a.size():
+            b = ZeroExt(a.size() - b.size(), b)
+        return LShR(a, b)
+
+    @staticmethod
+    def shift_left(a: ExprRef, b: ExprRef) -> ExprRef:
+        if b.size() > a.size():
+            b = Extract(a.size() - 1, 0, b)
+        if b.size() < a.size():
+            b = ZeroExt(a.size() - b.size(), b)
+        return a << b
+
     def exec_pcode_op(self, op: pypcode.PcodeOp):
         binops = {
             pypcode.OpCode.INT_XOR: lambda a,b: a ^ b,
@@ -175,11 +191,15 @@ class Cpu:
             pypcode.OpCode.INT_ADD: lambda a,b: a + b,
             pypcode.OpCode.INT_SUB: lambda a,b: a - b,
             pypcode.OpCode.INT_MULT: lambda a,b: a * b,
+            pypcode.OpCode.INT_REM: lambda a,b: URem(a,b),
             pypcode.OpCode.INT_OR: lambda a,b: a | b,
+            pypcode.OpCode.INT_RIGHT: Cpu.shift_right,
+            pypcode.OpCode.INT_LEFT: Cpu.shift_left,
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
             pypcode.OpCode.INT_EQUAL: lambda a,b: a == b,
+            pypcode.OpCode.INT_NOTEQUAL: lambda a,b: a != b,
             pypcode.OpCode.INT_SCARRY: lambda a,b: Not(BVAddNoOverflow(a, b, True)),
         }
         if op.opcode == pypcode.OpCode.IMARK:
@@ -208,6 +228,17 @@ class Cpu:
             mem_access = MemAccess(addr, op.inputs[2].size)
             result = self.read_varnode(op.inputs[2])
             self.write_mem(mem_access, result)
+        elif op.opcode == pypcode.OpCode.SUBPIECE:
+            assert len(op.inputs) == 2
+            shit_amount_varnode = op.inputs[1]
+            assert shit_amount_varnode.space.name == 'const'
+            shift_amount = shit_amount_varnode.offset
+            value = self.read_varnode(op.inputs[0])
+            result = value >> shift_amount
+            output_size_in_bits = op.output.size * BITS_PER_BYTE
+            if result.size() > output_size_in_bits:
+                result = Extract(output_size_in_bits - 1, 0, result)
+            self.write_varnode(op.output, result)
         elif op.opcode == pypcode.OpCode.POPCOUNT:
             input = self.read_varnode(op.inputs[0])
             desired_size = op.output.size * BITS_PER_BYTE
@@ -228,6 +259,15 @@ class Cpu:
             value = self.read_varnode(op.inputs[0])
             expand_by_bytes_amount = op.output.size - op.inputs[0].size
             result = SignExt(expand_by_bytes_amount * BITS_PER_BYTE, value)
+            self.write_varnode(op.output, result)
+        elif op.opcode == pypcode.OpCode.INT_NEGATE:
+            assert len(op.inputs) == 1
+            value = self.read_varnode(op.inputs[0])
+            self.write_varnode(op.output, -value)
+        elif op.opcode == pypcode.OpCode.BOOL_NEGATE:
+            assert len(op.inputs) == 1
+            value = self.read_varnode(op.inputs[0])
+            result = If(value == 0, BitVecVal(1, 8), BitVecVal(0, 8))
             self.write_varnode(op.output, result)
         elif op.opcode in binops:
             binop = binops[op.opcode]
