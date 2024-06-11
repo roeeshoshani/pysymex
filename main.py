@@ -43,6 +43,8 @@ def is_extract(expr: ExprRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
 
 def are_concretely_equal(a: ExprRef, b: ExprRef) -> bool:
+    if a.size() != b.size():
+        return False
     solver = Solver()
     solver.add(a != b)
     return solver.check() == unsat
@@ -168,7 +170,7 @@ class Cpu:
 
     def write_varnode_single_byte(self, addr: VarnodeAddr, value: ExprRef):
         assert value.size() == 8
-        self.varnode_values[addr] = simplify(value)
+        self.varnode_values[addr] = value
         
     def write_varnode(self, varnode: pypcode.Varnode, value: ExprRef):
         assert value.size() == varnode.size * BITS_PER_BYTE
@@ -186,7 +188,7 @@ class Cpu:
         # this is important since simplification makes the expression deterministic.
         addr = MemAddr(addr.space_id, simplify(addr.offset))
 
-        self.mem_values[addr] = simplify(value)
+        self.mem_values[addr] = value
         
     def write_mem(self, access: MemAccess, value: ExprRef):
         assert value.size() == access.size_in_bytes * BITS_PER_BYTE
@@ -409,7 +411,7 @@ def exec_dump_file():
 
 def quick():
     cpu = Cpu()
-    cpu.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59")
+    cpu.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59", 0)
     print(cpu.regs.rcx)
 
 # quick()
