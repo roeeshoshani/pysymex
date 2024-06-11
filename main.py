@@ -152,7 +152,11 @@ class Cpu:
             addr = MemAddr(access.addr.space_id, access.addr.offset + rel_byte_off)
             single_byte_values.append(self.read_mem_single_byte(addr))
         single_byte_values.reverse()
-        return Concat(single_byte_values)
+        single_byte_values = simplify_concat_extract(single_byte_values)
+        if len(single_byte_values) == 1:
+            return single_byte_values[0]
+        else:
+            return Concat(single_byte_values)
 
     def read_mem(self, access: MemAccess) -> ExprRef:
         if access.size_in_bytes == 1:
