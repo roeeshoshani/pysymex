@@ -1,9 +1,10 @@
 from __future__ import annotations
 from z3 import *
 from capstone import *
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, List
 from dataclasses import dataclass
 from minidump.minidumpfile import MinidumpFile
+from IPython import embed
 import pypcode
 
 BITS_PER_BYTE = 8
@@ -37,6 +38,34 @@ class ExecRes:
 @dataclass(frozen=True)
 class ExecPcodeOpRes:
     branched_to: Optional[ExprRef]
+
+def is_extract(expr: ExprRef) -> bool:
+    return is_app_of(expr, Z3_OP_EXTRACT)
+
+def are_concretely_equal(a: ExprRef, b: ExprRef) -> bool:
+    solver = Solver()
+    solver.add(a != b)
+    return solver.check() == unsat
+
+def simplify_concat_extract(single_byte_values: List[ExprRef]) -> List[ExprRef]:
+    if len(single_byte_values) == 1:
+        return single_byte_values
+    for i in range(len(single_byte_values) - 1):
+        [byte_val_a, byte_val_b] = single_byte_values[i:i+2]
+        if not is_extract(byte_val_a) or not is_extract(byte_val_b):
+            continue
+        [a_high, a_low] = byte_val_a.params()
+        [b_high, b_low] = byte_val_b.params()
+        if b_high + 1 != a_low:
+            # not consequtive
+            continue
+        if not are_concretely_equal(byte_val_a.arg(0), byte_val_b.arg(0)):
+            # not equal, can't merge
+            continue
+        combined = Extract(a_high, b_low, byte_val_a.arg(0))
+        new_values =single_byte_values[:i] + [combined] + single_byte_values[i+2:]
+        return simplify_concat_extract(new_values)
+    return single_byte_values
 
 class Cpu:
     def __init__(self):
@@ -83,7 +112,11 @@ class Cpu:
             addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
             single_byte_values.append(self.read_varnode_single_byte(addr))
         single_byte_values.reverse()
-        return Concat(single_byte_values)
+        single_byte_values = simplify_concat_extract(single_byte_values)
+        if len(single_byte_values) == 1:
+            return single_byte_values[0]
+        else:
+            return Concat(single_byte_values)
 
     def read_non_const_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
         if varnode.size == 1:
@@ -98,7 +131,6 @@ class Cpu:
         if varnode.space.name == 'const':
             return BitVecVal(varnode.offset, varnode.size * BITS_PER_BYTE)
         else:
-            x = self.read_non_const_varnode(varnode)
             return simplify(self.read_non_const_varnode(varnode))
 
     def read_mem_single_byte(self, addr: MemAddr) -> ExprRef:
@@ -309,6 +341,11 @@ class Cpu:
                     pass
             else:
                 raise Exception('unresolved condition')
+        elif op.opcode == pypcode.OpCode.RETURN:
+            assert len(op.inputs) == 1
+            addr = self.read_varnode(op.inputs[0])
+            print('RETURN TO {}', addr)
+            assert False, 'IMPLEMENT THIS'
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
