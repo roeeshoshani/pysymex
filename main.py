@@ -18,13 +18,8 @@ class VarnodeAddr:
     off: int
 
 @dataclass(frozen=True)
-class MemAddr:
-    space_id: int
-    offset: ExprRef
-
-@dataclass(frozen=True)
 class MemAccess:
-    addr: MemAddr
+    addr: ExprRef
     size_in_bytes: int
 
 def bits_to_bytes_safe(bits_amount: int) -> int:
@@ -32,12 +27,17 @@ def bits_to_bytes_safe(bits_amount: int) -> int:
     return bits_amount // BITS_PER_BYTE
 
 @dataclass(frozen=True)
+class BranchedTo:
+    addr: ExprRef
+    is_ret: bool
+
+@dataclass(frozen=True)
 class ExecRes:
-    branched_to: Optional[ExprRef]
+    branched_to: Optional[BranchedTo]
 
 @dataclass(frozen=True)
 class ExecPcodeOpRes:
-    branched_to: Optional[ExprRef]
+    branched_to: Optional[BranchedTo]
 
 def is_extract(expr: ExprRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
@@ -136,15 +136,15 @@ class Cpu:
         else:
             return simplify(self.read_non_const_varnode(varnode))
 
-    def read_mem_single_byte(self, addr: MemAddr) -> ExprRef:
+    def read_mem_single_byte(self, addr: ExprRef) -> ExprRef:
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
-        addr = MemAddr(addr.space_id, simplify(addr.offset))
+        addr = simplify(addr)
         if addr in self.mem_values:
             return self.mem_values[addr]
         else:
             # value is uninitialized, need to initialize it with a variable
-            # var_name = 'orig_mem_{}[{}]'.format(addr.space_id, addr.offset)
+            # var_name = 'orig_mem[{}]'.format(addr)
             mem_var_id = len(self.mem_var_addresses)
             var_name = 'orig_mem_{}'.format(mem_var_id)
             self.mem_var_addresses.append(addr)
@@ -155,7 +155,7 @@ class Cpu:
     def read_multibyte_mem(self, access: MemAccess) -> ExprRef:
         single_byte_values = []
         for rel_byte_off in range(access.size_in_bytes):
-            addr = MemAddr(access.addr.space_id, access.addr.offset + rel_byte_off)
+            addr = access.addr + rel_byte_off
             single_byte_values.append(self.read_mem_single_byte(addr))
         single_byte_values.reverse()
         single_byte_values = simplify_concat_extract(single_byte_values)
@@ -165,6 +165,7 @@ class Cpu:
             return Concat(single_byte_values)
 
     def read_mem(self, access: MemAccess) -> ExprRef:
+        print('reading {} bytes of memory from {}'.format(access.size_in_bytes, access.addr))
         if access.size_in_bytes == 1:
             # single byte
             return self.read_mem_single_byte(access.addr)
@@ -185,12 +186,12 @@ class Cpu:
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_varnode_single_byte(addr, extracted_byte)
 
-    def write_mem_single_byte(self, addr: MemAddr, value: ExprRef):
+    def write_mem_single_byte(self, addr: ExprRef, value: ExprRef):
         assert value.size() == 8
 
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
-        addr = MemAddr(addr.space_id, simplify(addr.offset))
+        addr = simplify(addr)
 
         self.mem_values[addr] = value
         
@@ -198,7 +199,7 @@ class Cpu:
         assert value.size() == access.size_in_bytes * BITS_PER_BYTE
         value = simplify(value)
         for rel_byte_off in range(access.size_in_bytes):
-            addr = MemAddr(access.addr.space_id, access.addr.offset + rel_byte_off)
+            addr = access.addr + rel_byte_off
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_mem_single_byte(addr, extracted_byte)
@@ -269,8 +270,7 @@ class Cpu:
             space_id_input = op.inputs[0]
             assert space_id_input.space.name == 'const'
             space_id = space_id_input.offset
-            offset = self.read_varnode(op.inputs[1])
-            addr = MemAddr(space_id, offset)
+            addr = self.read_varnode(op.inputs[1])
             mem_access = MemAccess(addr, op.output.size)
             result = self.read_mem(mem_access)
             self.write_varnode(op.output, result)
@@ -279,8 +279,7 @@ class Cpu:
             space_id_input = op.inputs[0]
             assert space_id_input.space.name == 'const'
             space_id = space_id_input.offset
-            offset = self.read_varnode(op.inputs[1])
-            addr = MemAddr(space_id, offset)
+            addr = self.read_varnode(op.inputs[1])
             mem_access = MemAccess(addr, op.inputs[2].size)
             result = self.read_varnode(op.inputs[2])
             self.write_mem(mem_access, result)
@@ -334,7 +333,7 @@ class Cpu:
             addr_varnode = op.inputs[0]
             assert addr_varnode.space.name == 'ram'
             addr = addr_varnode.offset
-            branched_to = BitVecVal(addr, 64)
+            branched_to = BranchedTo(BitVecVal(addr, 64), False)
         elif op.opcode == pypcode.OpCode.CBRANCH:
             assert len(op.inputs) == 2
             addr_varnode = op.inputs[0]
@@ -345,7 +344,7 @@ class Cpu:
                 cond = cond_expr.as_long()
                 assert cond == 0 or cond == 1
                 if cond != 0:
-                    branched_to = BitVecVal(addr, 64)
+                    branched_to = BranchedTo(BitVecVal(addr, 64), False)
                 else:
                     # the branch is not takes, do nothing
                     pass
@@ -354,8 +353,7 @@ class Cpu:
         elif op.opcode == pypcode.OpCode.RETURN:
             assert len(op.inputs) == 1
             addr = self.read_varnode(op.inputs[0])
-            print('RETURN TO {}', addr)
-            assert False, 'IMPLEMENT THIS'
+            branched_to = BranchedTo(addr, True)
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
@@ -398,6 +396,8 @@ def exec_dump_file():
     dump_reader = dump.get_reader()
     cs = Cs(CS_ARCH_X86, CS_MODE_64)
 
+    cpu.write_mem(MemAccess(cpu.regs.rsp + 8, 8), BitVec('pushed_magic', 64))
+
     cur_addr = VIRT_ENTRY_POINT_ADDR
     while True:
         insn_bytes = dump_reader.read(cur_addr, X86_MAX_INSN_LEN)
@@ -408,8 +408,8 @@ def exec_dump_file():
         res = cpu.exec_single_insn(insn_bytes[:insn_size], cur_addr)
 
         if res.branched_to != None:
-            assert isinstance(res.branched_to, BitVecNumRef)
-            cur_addr = res.branched_to.as_long()
+            assert isinstance(res.branched_to.addr, BitVecNumRef)
+            cur_addr = res.branched_to.addr.as_long()
         else:
             cur_addr += insn_size
 
