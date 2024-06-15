@@ -11,6 +11,8 @@ BITS_PER_BYTE = 8
 DUMP_FILE_PATH = '/home/sho/Documents/freelance/getcode/GetCode.DMP'
 VIRT_ENTRY_POINT_ADDR = 0x00d6bd08
 X86_MAX_INSN_LEN = 15
+EXAMPLE_PUSHED_MAGIC = 0x72a7c5d7
+MEM_VAR_NAME_PREFIX = 'orig_mem'
 
 @dataclass(frozen=True)
 class VarnodeAddr:
@@ -32,12 +34,15 @@ class BranchedTo:
     is_ret: bool
 
 @dataclass(frozen=True)
-class ExecRes:
-    branched_to: Optional[BranchedTo]
-
-@dataclass(frozen=True)
 class ExecPcodeOpRes:
     branched_to: Optional[BranchedTo]
+
+@dataclass
+class Successor:
+    state: State
+    next_insn_addr: ExprRef
+    is_branch: bool
+    is_return: bool
 
 def is_extract(expr: ExprRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
@@ -69,12 +74,19 @@ def simplify_concat_extract(single_byte_values: List[ExprRef]) -> List[ExprRef]:
         return simplify_concat_extract(new_values)
     return single_byte_values
 
-class Cpu:
+class State:
     def __init__(self):
         self.ctx = pypcode.Context("x86:LE:64:default")
         self.varnode_values = {}
         self.mem_values = {}
         self.mem_var_addresses = []
+
+    def copy(self):
+        new_state = State()
+        new_state.varnode_values = self.varnode_values.copy()
+        new_state.mem_values = self.mem_values.copy()
+        new_state.mem_var_addresses = self.mem_var_addresses.copy()
+        return new_state
 
     def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
         for reg_name, reg_varnode in self.ctx.registers.items():
@@ -144,9 +156,9 @@ class Cpu:
             return self.mem_values[addr]
         else:
             # value is uninitialized, need to initialize it with a variable
-            # var_name = 'orig_mem[{}]'.format(addr)
+            # var_name = '{}[{}]'.format(MEM_VAR_NAME_PREFIX, addr)
             mem_var_id = len(self.mem_var_addresses)
-            var_name = 'orig_mem_{}'.format(mem_var_id)
+            var_name = '{}_{}'.format(MEM_VAR_NAME_PREFIX, mem_var_id)
             self.mem_var_addresses.append(addr)
             var = BitVec(var_name, 8)
             self.write_mem_single_byte(addr, var)
@@ -165,7 +177,6 @@ class Cpu:
             return Concat(single_byte_values)
 
     def read_mem(self, access: MemAccess) -> ExprRef:
-        print('reading {} bytes of memory from {}'.format(access.size_in_bytes, access.addr))
         if access.size_in_bytes == 1:
             # single byte
             return self.read_mem_single_byte(access.addr)
@@ -235,7 +246,7 @@ class Cpu:
             b = ZeroExt(a.size() - b.size(), b)
         return a << b
 
-    def exec_pcode_op(self, op: pypcode.PcodeOp) -> ExecPcodeOpRes:
+    def exec_pcode_op(self, op: pypcode.PcodeOp):
         binops = {
             pypcode.OpCode.INT_XOR: lambda a,b: a ^ b,
             pypcode.OpCode.INT_AND: lambda a,b: a & b,
@@ -244,8 +255,8 @@ class Cpu:
             pypcode.OpCode.INT_MULT: lambda a,b: a * b,
             pypcode.OpCode.INT_REM: lambda a,b: URem(a,b),
             pypcode.OpCode.INT_OR: lambda a,b: a | b,
-            pypcode.OpCode.INT_RIGHT: Cpu.shift_right,
-            pypcode.OpCode.INT_LEFT: Cpu.shift_left,
+            pypcode.OpCode.INT_RIGHT: State.shift_right,
+            pypcode.OpCode.INT_LEFT: State.shift_left,
             pypcode.OpCode.BOOL_OR: lambda a,b: a | b,
             pypcode.OpCode.BOOL_XOR: lambda a,b: a ^ b,
         }
@@ -258,7 +269,6 @@ class Cpu:
             pypcode.OpCode.INT_CARRY: lambda a,b: Not(BVAddNoOverflow(a, b, False)),
             pypcode.OpCode.INT_SBORROW: lambda a,b: Or(Not(BVSubNoUnderflow(a, b, True)), Not(BVSubNoOverflow(a, b))),
         }
-        branched_to = None
         if op.opcode == pypcode.OpCode.IMARK:
             # do nothing
             pass
@@ -328,32 +338,32 @@ class Cpu:
             value = self.read_varnode(op.inputs[0])
             result = If(value == 0, BitVecVal(1, 8), BitVecVal(0, 8))
             self.write_varnode(op.output, result)
-        elif op.opcode == pypcode.OpCode.BRANCH:
-            assert len(op.inputs) == 1
-            addr_varnode = op.inputs[0]
-            assert addr_varnode.space.name == 'ram'
-            addr = addr_varnode.offset
-            branched_to = BranchedTo(BitVecVal(addr, 64), False)
-        elif op.opcode == pypcode.OpCode.CBRANCH:
-            assert len(op.inputs) == 2
-            addr_varnode = op.inputs[0]
-            assert addr_varnode.space.name == 'ram'
-            addr = addr_varnode.offset
-            cond_expr = self.read_varnode(op.inputs[1])
-            if isinstance(cond_expr, BitVecNumRef):
-                cond = cond_expr.as_long()
-                assert cond == 0 or cond == 1
-                if cond != 0:
-                    branched_to = BranchedTo(BitVecVal(addr, 64), False)
-                else:
-                    # the branch is not takes, do nothing
-                    pass
-            else:
-                raise Exception('unresolved condition')
-        elif op.opcode == pypcode.OpCode.RETURN:
-            assert len(op.inputs) == 1
-            addr = self.read_varnode(op.inputs[0])
-            branched_to = BranchedTo(addr, True)
+        # elif op.opcode == pypcode.OpCode.BRANCH:
+        #     assert len(op.inputs) == 1
+        #     addr_varnode = op.inputs[0]
+        #     assert addr_varnode.space.name == 'ram'
+        #     addr = addr_varnode.offset
+        #     branched_to = BranchedTo(BitVecVal(addr, 64), False)
+        # elif op.opcode == pypcode.OpCode.CBRANCH:
+        #     assert len(op.inputs) == 2
+        #     addr_varnode = op.inputs[0]
+        #     assert addr_varnode.space.name == 'ram'
+        #     addr = addr_varnode.offset
+        #     cond_expr = self.read_varnode(op.inputs[1])
+        #     if isinstance(cond_expr, BitVecNumRef):
+        #         cond = cond_expr.as_long()
+        #         assert cond == 0 or cond == 1
+        #         if cond != 0:
+        #             branched_to = BranchedTo(BitVecVal(addr, 64), False)
+        #         else:
+        #             # the branch is not takes, do nothing
+        #             pass
+        #     else:
+        #         raise Exception('unresolved condition')
+        # elif op.opcode == pypcode.OpCode.RETURN:
+        #     assert len(op.inputs) == 1
+        #     addr = self.read_varnode(op.inputs[0])
+        #     branched_to = BranchedTo(addr, True)
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
@@ -362,61 +372,123 @@ class Cpu:
             self.exec_comparison(op, comparison)
         else:
             raise Exception('no handler for opcode {}'.format(op.opcode))
-        return ExecPcodeOpRes(branched_to)
+        # return ExecPcodeOpRes(branched_to)
 
-    def exec_single_insn(self, code: bytes, base_addr: int) -> ExecRes:
+    def exec_single_insn(self, code: bytes, base_addr: int) -> List[Successor]:
         tx = self.ctx.translate(code,base_address=base_addr)
         branched_to = None
+        assert len(tx.ops) > 0
+        imark_op = tx.ops[0]
+        assert imark_op.opcode == pypcode.OpCode.IMARK
+        assert imark_op.inputs[0].offset == base_addr
+
         for i, op in enumerate(tx.ops):
-            res = self.exec_pcode_op(op)
-            if res.branched_to != None:
-                branched_to = res.branched_to
-                # make sure that this is the last pcode insn
-                assert i + 1 == len(tx.ops)
-                break
-        return ExecRes(branched_to)
+            if op.opcode == pypcode.OpCode.IMARK:
+                if i == 0:
+                    # we already looked at this pcode insn before the loop, ignore it
+                    continue
+                else:
+                    # we reached the next instruction, don't execute it
+                    break
+            elif op.opcode == pypcode.OpCode.BRANCH:
+                assert len(op.inputs) == 1
+                addr_varnode = op.inputs[0]
+                assert addr_varnode.space.name == 'ram'
+                addr = addr_varnode.offset
+                return [Successor(self, BitVecVal(addr, 64), True, False)]
+            elif op.opcode == pypcode.OpCode.CBRANCH:
+                assert len(op.inputs) == 2
+                addr_varnode = op.inputs[0]
+                assert addr_varnode.space.name == 'ram'
+                addr = addr_varnode.offset
+                cond_expr = self.read_varnode(op.inputs[1])
+                if isinstance(cond_expr, BitVecNumRef):
+                    cond = cond_expr.as_long()
+                    assert cond == 0 or cond == 1
+                    if cond != 0:
+                        return [Successor(self, BitVecVal(addr, 64), True, False)]
+                    else:
+                        # the branch is not taken, continue to the next pcode insn
+                        continue
+                else:
+                    raise Exception('unresolved condition')
+            elif op.opcode == pypcode.OpCode.RETURN:
+                assert len(op.inputs) == 1
+                addr = self.read_varnode(op.inputs[0])
+                return [Successor(self, addr, True, True)]
+                
+            self.exec_pcode_op(op)
+        return [Successor(self, BitVecVal(base_addr + imark_op.inputs[0].size, 64), False, False)]
 
     @property
-    def regs(self) -> CpuRegs:
-        return CpuRegs(self)
+    def regs(self) -> StateRegs:
+        return StateRegs(self)
             
 @dataclass
-class CpuRegs:
-    cpu: Cpu
+class StateRegs:
+    state: State
     def __getattr__(self, name):
-        for reg_name, reg_varnode in self.cpu.ctx.registers.items():
+        for reg_name, reg_varnode in self.state.ctx.registers.items():
             if reg_name.lower() == name:
-                return self.cpu.read_varnode(reg_varnode)
+                return self.state.read_varnode(reg_varnode)
         raise Exception('no register named {}'.format(name))
     
 
+def expr_to_concrete(expr: ExprRef) -> int:
+    assert isinstance(expr, BitVecNumRef), 'expression {} is not a concrete value, its type is {}'.format(expr, type(expr))
+    return expr.as_long()
+    
+
 def exec_dump_file():
-    cpu = Cpu()
+    state = State()
     dump = MinidumpFile.parse(DUMP_FILE_PATH)
     dump_reader = dump.get_reader()
     cs = Cs(CS_ARCH_X86, CS_MODE_64)
 
-    cpu.write_mem(MemAccess(cpu.regs.rsp + 8, 8), BitVec('pushed_magic', 64))
+    pushed_magic = BitVec('pushed_magic', 64)
+    state.write_mem(MemAccess(state.regs.rsp + 8, 8), pushed_magic)
 
     cur_addr = VIRT_ENTRY_POINT_ADDR
     while True:
         insn_bytes = dump_reader.read(cur_addr, X86_MAX_INSN_LEN)
-        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, cur_addr))
 
+        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, cur_addr))
         print('executing insn {} {} {}'.format(hex(cur_addr), insn_mnemonic, insn_op_str))
 
-        res = cpu.exec_single_insn(insn_bytes[:insn_size], cur_addr)
+        successors = state.exec_single_insn(insn_bytes, cur_addr)
 
-        if res.branched_to != None:
-            assert isinstance(res.branched_to.addr, BitVecNumRef)
-            cur_addr = res.branched_to.addr.as_long()
+        assert len(successors) == 1
+        successor = successors[0]
+
+        if successor.is_return:
+            # return
+            ret_addr = successor.next_insn_addr
+
+            pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
+            ret_addr = substitute(ret_addr, (pushed_magic, pushed_magic_example_value))
+            vars = z3util.get_vars(ret_addr)
+            for var in vars:
+                prefix = MEM_VAR_NAME_PREFIX + '_'
+                var_name = var.decl().name()
+                assert var_name.startswith(prefix)
+                var_id = int(var_name[len(prefix):])
+                mem_addr_expr = state.mem_var_addresses[var_id]
+                mem_addr_expr = simplify(substitute(mem_addr_expr, (pushed_magic, pushed_magic_example_value)))
+                mem_addr = expr_to_concrete(mem_addr_expr)
+                assert var.size() == 8
+                mem_byte_value = dump_reader.read(mem_addr, 1)[0]
+                ret_addr = substitute(ret_addr, (var, BitVecVal(mem_byte_value, 8)))
+
+            ret_addr = simplify(ret_addr)
+            print(ret_addr)
+            raise
         else:
-            cur_addr += insn_size
+            cur_addr = expr_to_concrete(successor.next_insn_addr)
 
 def quick():
-    cpu = Cpu()
-    cpu.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59", 0)
-    print(cpu.regs.rcx)
+    state = State()
+    state.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59", 0)
+    print(statesuccessor.next_insn_addr.rcx)
 
 # quick()
 exec_dump_file()
