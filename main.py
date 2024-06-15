@@ -332,7 +332,7 @@ class State:
         elif op.opcode == pypcode.OpCode.INT_NEGATE:
             assert len(op.inputs) == 1
             value = self.read_varnode(op.inputs[0])
-            self.write_varnode(op.output, -value)
+            self.write_varnode(op.output, ~value)
         elif op.opcode == pypcode.OpCode.BOOL_NEGATE:
             assert len(op.inputs) == 1
             value = self.read_varnode(op.inputs[0])
@@ -373,6 +373,31 @@ class State:
         else:
             raise Exception('no handler for opcode {}'.format(op.opcode))
         # return ExecPcodeOpRes(branched_to)
+
+    def substitute(self, expr: ExprRef, *substitutions):
+        expr = substitute(expr, *substitutions)
+        vars = z3util.get_vars(expr)
+        while True:
+            did_anything = False
+            for var in vars:
+                prefix = MEM_VAR_NAME_PREFIX + '_'
+                var_name = var.decl().name()
+                if not var_name.startswith(prefix):
+                    continue
+                var_id = int(var_name[len(prefix):])
+                mem_addr_expr = state.mem_var_addresses[var_id]
+                mem_addr_expr = simplify(substitute(mem_addr_expr, (pushed_magic, pushed_magic_example_value)))
+                if isinstance(mem_addr_expr, BitVecNumRef):
+                    mem_addr = mem_addr_expr.as_long()
+                    assert var.size() == 8
+                    mem_byte_value = dump_reader.read(mem_addr, 1)[0]
+                    expr = substitute(expr, (var, BitVecVal(mem_byte_value, 8)))
+                    did_anything = True
+            if not did_anything:
+                break
+
+        expr = simplify(expr)
+        return expr
 
     def exec_single_insn(self, code: bytes, base_addr: int) -> List[Successor]:
         tx = self.ctx.translate(code,base_address=base_addr)
@@ -449,6 +474,9 @@ def exec_dump_file():
     state.write_mem(MemAccess(state.regs.rsp + 8, 8), pushed_magic)
 
     cur_addr = VIRT_ENTRY_POINT_ADDR
+    pushed_magic_example_value = BitVecVal(0x4141414141414141, 64)
+    # pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
+
     while True:
         insn_bytes = dump_reader.read(cur_addr, X86_MAX_INSN_LEN)
 
@@ -459,26 +487,16 @@ def exec_dump_file():
 
         assert len(successors) == 1
         successor = successors[0]
+        state = successor.state
 
+        print('r10 = {}'.format(state.substitute(state.regs.r10, (pushed_magic, pushed_magic_example_value))))
+        print('rsi = {}'.format(state.substitute(state.regs.rsi, (pushed_magic, pushed_magic_example_value))))
+        
         if successor.is_return:
             # return
             ret_addr = successor.next_insn_addr
 
-            pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
-            ret_addr = substitute(ret_addr, (pushed_magic, pushed_magic_example_value))
-            vars = z3util.get_vars(ret_addr)
-            for var in vars:
-                prefix = MEM_VAR_NAME_PREFIX + '_'
-                var_name = var.decl().name()
-                assert var_name.startswith(prefix)
-                var_id = int(var_name[len(prefix):])
-                mem_addr_expr = state.mem_var_addresses[var_id]
-                mem_addr_expr = simplify(substitute(mem_addr_expr, (pushed_magic, pushed_magic_example_value)))
-                mem_addr = expr_to_concrete(mem_addr_expr)
-                assert var.size() == 8
-                mem_byte_value = dump_reader.read(mem_addr, 1)[0]
-                ret_addr = substitute(ret_addr, (var, BitVecVal(mem_byte_value, 8)))
-
+            ret_addr = state.substitute(ret_addr, (pushed_magic, pushed_magic_example_value))
             ret_addr = simplify(ret_addr)
             print(ret_addr)
             raise
