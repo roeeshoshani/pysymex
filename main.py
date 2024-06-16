@@ -29,15 +29,6 @@ def bits_to_bytes_safe(bits_amount: int) -> int:
     assert bits_amount % BITS_PER_BYTE == 0
     return bits_amount // BITS_PER_BYTE
 
-@dataclass(frozen=True)
-class BranchedTo:
-    addr: BitVecRef
-    is_ret: bool
-
-@dataclass(frozen=True)
-class ExecPcodeOpRes:
-    branched_to: Optional[BranchedTo]
-
 @dataclass
 class Successor:
     state: State
@@ -537,42 +528,6 @@ def exec_dump_file_with_manager():
     # cur_addr = VIRT_ENTRY_POINT_ADDR
     # pushed_magic_example_value = BitVecVal(0x4141414141414141, 64)
     # pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
-
-def exec_dump_file():
-    state = State()
-    dump = MinidumpFile.parse(DUMP_FILE_PATH)
-    dump_reader = dump.get_reader()
-    cs = Cs(CS_ARCH_X86, CS_MODE_64)
-
-    pushed_magic = BitVec('pushed_magic', 64)
-    state.write_mem(MemAccess(state.regs.rsp + 8, 8), pushed_magic)
-
-    cur_addr = VIRT_ENTRY_POINT_ADDR
-    # pushed_magic_example_value = BitVecVal(0x4141414141414141, 64)
-    pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
-
-    while True:
-        insn_bytes = dump_reader.read(cur_addr, X86_MAX_INSN_LEN)
-
-        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, cur_addr))
-        print('executing insn {} {} {}'.format(hex(cur_addr), insn_mnemonic, insn_op_str))
-
-        successors = state.exec_single_insn(insn_bytes, cur_addr)
-
-        assert len(successors) == 1
-        successor = successors[0]
-        state = successor.state
-
-        if successor.is_return:
-            # return
-            ret_addr = successor.next_insn_addr
-
-            ret_addr = state.substitute(ret_addr, lambda addr: dump_reader.read(addr, 1)[0], (pushed_magic, pushed_magic_example_value))
-            ret_addr = simplify(ret_addr)
-            print(ret_addr)
-            raise
-        else:
-            cur_addr = expr_to_concrete(successor.next_insn_addr)
 
 # exec_dump_file()
 exec_dump_file_with_manager()
