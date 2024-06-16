@@ -275,10 +275,7 @@ class State:
             pypcode.OpCode.INT_CARRY: lambda a,b: Not(BVAddNoOverflow(a, b, False)),
             pypcode.OpCode.INT_SBORROW: lambda a,b: Or(Not(BVSubNoUnderflow(a, b, True)), Not(BVSubNoOverflow(a, b))),
         }
-        if op.opcode == pypcode.OpCode.IMARK:
-            # do nothing
-            pass
-        elif op.opcode == pypcode.OpCode.COPY:
+        if op.opcode == pypcode.OpCode.COPY:
             input = self.read_varnode(op.inputs[0])
             self.write_varnode(op.output, input)
         elif op.opcode == pypcode.OpCode.LOAD:
@@ -385,7 +382,7 @@ class State:
         assert imark_op.opcode == pypcode.OpCode.IMARK
         assert imark_op.inputs[0].offset == code_addr
         next_insn_addr = code_addr + imark_op.inputs[0].size
-        return self.exec_pcode_ops(tx.ops, next_insn_addr)
+        return self.exec_pcode_ops(tx.ops[1:], next_insn_addr)
 
     def add_constraint(self, constraint: BoolRef):
         self.constraints.append(constraint)
@@ -393,7 +390,10 @@ class State:
 
     def exec_pcode_ops(self, ops: List[pypcode.Instruction], next_insn_addr: int) -> List[Successor]:
         for i, op in enumerate(ops):
-            if op.opcode == pypcode.OpCode.BRANCH:
+            if op.opcode == pypcode.OpCode.IMARK:
+                # reached a second IMARK, so this is no longer the first instruction. stop executing.
+                break
+            elif op.opcode == pypcode.OpCode.BRANCH:
                 assert len(op.inputs) == 1
                 addr_varnode = op.inputs[0]
                 assert addr_varnode.space.name == 'ram'
