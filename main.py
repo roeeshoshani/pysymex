@@ -411,7 +411,7 @@ class State:
                 cond_value_expr = self.read_varnode(op.inputs[1])
 
                 # check if the condition is certainly false
-                cond_true_solve_result = solver.check(cond_value_expr != 0)
+                cond_true_solve_result = self.solver.check(cond_value_expr != 0)
                 if cond_true_solve_result == unsat:
                     # if the condition being true is unsatisfied, the condition is known to be false.
                     # thus, the branch is not taken, so continue to the next pcode insn.
@@ -420,7 +420,7 @@ class State:
                 # here, the condition being true is satisfiable, so it **might** be true, but we don't know if it is true or unconstrained.
                 # so, we must perform some other check to determine if it is certainly true.
 
-                cond_false_solve_result = solver.check(cond_value_expr == 0)
+                cond_false_solve_result = self.solver.check(cond_value_expr == 0)
                 if cond_false_solve_result == unsat:
                     # if the condition being false is unsatisfied, the condition is known to be true.
                     # thus, the branch is taken.
