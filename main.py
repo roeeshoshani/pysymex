@@ -15,6 +15,9 @@ X86_MAX_INSN_LEN = 15
 EXAMPLE_PUSHED_MAGIC = 0x6bfd0737
 MEM_VAR_NAME_PREFIX = 'orig_mem'
 
+DUMP_FILE = MinidumpFile.parse(DUMP_FILE_PATH)
+DUMP_READER = DUMP_FILE.get_reader()
+
 @dataclass(frozen=True)
 class VarnodeAddr:
     space: pypcode.AddrSpace
@@ -514,20 +517,21 @@ class SimManager:
                     new_active.append(ActiveState(new_state, next_insn_addr_concrete))
         self.active = new_active
 
+def read_dump_byte(addr: int) -> int:
+    return DUMP_READER.read(addr, 1)[0]
     
-
-def exec_dump_file_with_manager():
-    state = State()
-    dump = MinidumpFile.parse(DUMP_FILE_PATH)
-    dump_reader = dump.get_reader()
-    pushed_magic = BitVec('pushed_magic', 64)
-    state.write_mem(MemAccess(state.regs.rsp + 8, 8), pushed_magic)
-    simgr = SimManager(dump_reader, state,VIRT_ENTRY_POINT_ADDR)
+def get_vm_entrypoint_state(pushed_magic: BitVec) -> UnconstrainedState:
+    initial_state = State()
+    initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic)
+    simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
     simgr.run()
-    embed()
-    # cur_addr = VIRT_ENTRY_POINT_ADDR
-    # pushed_magic_example_value = BitVecVal(0x4141414141414141, 64)
-    # pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
+    assert len(simgr.unconstrained) == 1
+    return simgr.unconstrained[0]
 
-# exec_dump_file()
-exec_dump_file_with_manager()
+def main():
+    pushed_magic = BitVec('pushed_magic', 64)
+    vm_ep_state = get_vm_entrypoint_state(pushed_magic)
+    res = vm_ep_state.state.substitute(vm_ep_state.next_insn_addr, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
+    print(res)
+
+main()
