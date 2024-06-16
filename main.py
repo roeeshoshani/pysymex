@@ -4,6 +4,7 @@ from capstone import *
 from typing import Callable, Optional, Tuple, List
 from dataclasses import dataclass
 from minidump.minidumpfile import MinidumpFile
+from minidump.minidumpreader import MinidumpFileReader
 from IPython import embed
 import pypcode
 
@@ -21,7 +22,7 @@ class VarnodeAddr:
 
 @dataclass(frozen=True)
 class MemAccess:
-    addr: ExprRef
+    addr: BitVecRef
     size_in_bytes: int
 
 def bits_to_bytes_safe(bits_amount: int) -> int:
@@ -30,7 +31,7 @@ def bits_to_bytes_safe(bits_amount: int) -> int:
 
 @dataclass(frozen=True)
 class BranchedTo:
-    addr: ExprRef
+    addr: BitVecRef
     is_ret: bool
 
 @dataclass(frozen=True)
@@ -40,21 +41,22 @@ class ExecPcodeOpRes:
 @dataclass
 class Successor:
     state: State
-    next_insn_addr: ExprRef
+    next_insn_addr: BitVecRef
     is_branch: bool
     is_return: bool
 
-def is_extract(expr: ExprRef) -> bool:
+def is_extract(expr: BitVecRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
 
-def are_concretely_equal(a: ExprRef, b: ExprRef) -> bool:
+def copy_solver(solver: Solver) -> Solver:
+    return solver.translate(solver.ctx)
+
+def are_concretely_equal(solver: Solver, a: BitVecRef, b: BitVecRef) -> bool:
     if a.size() != b.size():
         return False
-    solver = Solver()
-    solver.add(a != b)
-    return solver.check() == unsat
+    return solver.check(a != b) == unsat
 
-def simplify_concat_extract(single_byte_values: List[ExprRef]) -> List[ExprRef]:
+def simplify_concat_extract(solver: Solver, single_byte_values: List[BitVecRef]) -> List[BitVecRef]:
     if len(single_byte_values) == 1:
         return single_byte_values
     for i in range(len(single_byte_values) - 1):
@@ -66,12 +68,12 @@ def simplify_concat_extract(single_byte_values: List[ExprRef]) -> List[ExprRef]:
         if b_high + 1 != a_low:
             # not consequtive
             continue
-        if not are_concretely_equal(byte_val_a.arg(0), byte_val_b.arg(0)):
+        if not are_concretely_equal(solver, byte_val_a.arg(0), byte_val_b.arg(0)):
             # not equal, can't merge
             continue
         combined = Extract(a_high, b_low, byte_val_a.arg(0))
         new_values =single_byte_values[:i] + [combined] + single_byte_values[i+2:]
-        return simplify_concat_extract(new_values)
+        return simplify_concat_extract(solver, new_values)
     return single_byte_values
 
 class State:
@@ -80,12 +82,16 @@ class State:
         self.varnode_values = {}
         self.mem_values = {}
         self.mem_var_addresses = []
+        self.constraints = []
+        self.solver = Solver()
 
     def copy(self):
         new_state = State()
         new_state.varnode_values = self.varnode_values.copy()
         new_state.mem_values = self.mem_values.copy()
         new_state.mem_var_addresses = self.mem_var_addresses.copy()
+        new_state.constraints = self.constraints.copy()
+        new_state.solver = copy_solver(self.solver)
         return new_state
 
     def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
@@ -103,7 +109,7 @@ class State:
         var = BitVec(var_name, reg_varnode.size * BITS_PER_BYTE)
         self.write_varnode(reg_varnode, var)
 
-    def read_varnode_single_byte(self, addr: VarnodeAddr) -> ExprRef:
+    def read_varnode_single_byte(self, addr: VarnodeAddr) -> BitVecRef:
         # this is important since simplification makes the expression deterministic.
         if addr in self.varnode_values:
             return self.varnode_values[addr]
@@ -121,19 +127,19 @@ class State:
                 self.write_varnode_single_byte(addr, var)
                 return var
 
-    def read_non_const_multibyte_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
+    def read_non_const_multibyte_varnode(self, varnode: pypcode.Varnode) -> BitVecRef:
         single_byte_values = []
         for rel_byte_off in range(varnode.size):
             addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
             single_byte_values.append(self.read_varnode_single_byte(addr))
         single_byte_values.reverse()
-        single_byte_values = simplify_concat_extract(single_byte_values)
+        single_byte_values = simplify_concat_extract(self.solver, single_byte_values)
         if len(single_byte_values) == 1:
             return single_byte_values[0]
         else:
             return Concat(single_byte_values)
 
-    def read_non_const_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
+    def read_non_const_varnode(self, varnode: pypcode.Varnode) -> BitVecRef:
         if varnode.size == 1:
             # single byte
             addr = VarnodeAddr(varnode.space, varnode.offset)
@@ -142,13 +148,13 @@ class State:
             # multi byte
             return self.read_non_const_multibyte_varnode(varnode)
 
-    def read_varnode(self, varnode: pypcode.Varnode) -> ExprRef:
+    def read_varnode(self, varnode: pypcode.Varnode) -> BitVecRef:
         if varnode.space.name == 'const':
             return BitVecVal(varnode.offset, varnode.size * BITS_PER_BYTE)
         else:
             return simplify(self.read_non_const_varnode(varnode))
 
-    def read_mem_single_byte(self, addr: ExprRef) -> ExprRef:
+    def read_mem_single_byte(self, addr: BitVecRef) -> BitVecRef:
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
         addr = simplify(addr)
@@ -164,19 +170,19 @@ class State:
             self.write_mem_single_byte(addr, var)
             return var
 
-    def read_multibyte_mem(self, access: MemAccess) -> ExprRef:
+    def read_multibyte_mem(self, access: MemAccess) -> BitVecRef:
         single_byte_values = []
         for rel_byte_off in range(access.size_in_bytes):
             addr = access.addr + rel_byte_off
             single_byte_values.append(self.read_mem_single_byte(addr))
         single_byte_values.reverse()
-        single_byte_values = simplify_concat_extract(single_byte_values)
+        single_byte_values = simplify_concat_extract(self.solver, single_byte_values)
         if len(single_byte_values) == 1:
             return single_byte_values[0]
         else:
             return Concat(single_byte_values)
 
-    def read_mem(self, access: MemAccess) -> ExprRef:
+    def read_mem(self, access: MemAccess) -> BitVecRef:
         if access.size_in_bytes == 1:
             # single byte
             return self.read_mem_single_byte(access.addr)
@@ -184,11 +190,11 @@ class State:
             # multi byte
             return simplify(self.read_multibyte_mem(access))
 
-    def write_varnode_single_byte(self, addr: VarnodeAddr, value: ExprRef):
+    def write_varnode_single_byte(self, addr: VarnodeAddr, value: BitVecRef):
         assert value.size() == 8
         self.varnode_values[addr] = value
         
-    def write_varnode(self, varnode: pypcode.Varnode, value: ExprRef):
+    def write_varnode(self, varnode: pypcode.Varnode, value: BitVecRef):
         assert value.size() == varnode.size * BITS_PER_BYTE
         value = simplify(value)
         for rel_byte_off in range(varnode.size):
@@ -197,7 +203,7 @@ class State:
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_varnode_single_byte(addr, extracted_byte)
 
-    def write_mem_single_byte(self, addr: ExprRef, value: ExprRef):
+    def write_mem_single_byte(self, addr: BitVecRef, value: BitVecRef):
         assert value.size() == 8
 
         # simplify the address before trying to access the dictionary.
@@ -206,7 +212,7 @@ class State:
 
         self.mem_values[addr] = value
         
-    def write_mem(self, access: MemAccess, value: ExprRef):
+    def write_mem(self, access: MemAccess, value: BitVecRef):
         assert value.size() == access.size_in_bytes * BITS_PER_BYTE
         value = simplify(value)
         for rel_byte_off in range(access.size_in_bytes):
@@ -215,14 +221,14 @@ class State:
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_mem_single_byte(addr, extracted_byte)
 
-    def exec_binop(self, op: pypcode.PcodeOp, binary_operation: Callable[[ExprRef, ExprRef], ExprRef]):
+    def exec_binop(self, op: pypcode.PcodeOp, binary_operation: Callable[[BitVecRef, BitVecRef], BitVecRef]):
         assert len(op.inputs) == 2
         input_a = self.read_varnode(op.inputs[0])
         input_b = self.read_varnode(op.inputs[1])
         result = binary_operation(input_a, input_b)
         self.write_varnode(op.output, result)
 
-    def exec_comparison(self, op: pypcode.PcodeOp, comparison_operation: Callable[[ExprRef, ExprRef], BoolRef]):
+    def exec_comparison(self, op: pypcode.PcodeOp, comparison_operation: Callable[[BitVecRef, BitVecRef], BoolRef]):
         assert len(op.inputs) == 2
         input_a = self.read_varnode(op.inputs[0])
         input_b = self.read_varnode(op.inputs[1])
@@ -231,7 +237,7 @@ class State:
         self.write_varnode(op.output, result)
 
     @staticmethod
-    def shift_right(a: ExprRef, b: ExprRef) -> ExprRef:
+    def shift_right(a: BitVecRef, b: BitVecRef) -> BitVecRef:
         if b.size() > a.size():
             b = Extract(a.size() - 1, 0, b)
         if b.size() < a.size():
@@ -239,7 +245,7 @@ class State:
         return LShR(a, b)
 
     @staticmethod
-    def shift_left(a: ExprRef, b: ExprRef) -> ExprRef:
+    def shift_left(a: BitVecRef, b: BitVecRef) -> BitVecRef:
         if b.size() > a.size():
             b = Extract(a.size() - 1, 0, b)
         if b.size() < a.size():
@@ -338,32 +344,6 @@ class State:
             value = self.read_varnode(op.inputs[0])
             result = If(value == 0, BitVecVal(1, 8), BitVecVal(0, 8))
             self.write_varnode(op.output, result)
-        # elif op.opcode == pypcode.OpCode.BRANCH:
-        #     assert len(op.inputs) == 1
-        #     addr_varnode = op.inputs[0]
-        #     assert addr_varnode.space.name == 'ram'
-        #     addr = addr_varnode.offset
-        #     branched_to = BranchedTo(BitVecVal(addr, 64), False)
-        # elif op.opcode == pypcode.OpCode.CBRANCH:
-        #     assert len(op.inputs) == 2
-        #     addr_varnode = op.inputs[0]
-        #     assert addr_varnode.space.name == 'ram'
-        #     addr = addr_varnode.offset
-        #     cond_expr = self.read_varnode(op.inputs[1])
-        #     if isinstance(cond_expr, BitVecNumRef):
-        #         cond = cond_expr.as_long()
-        #         assert cond == 0 or cond == 1
-        #         if cond != 0:
-        #             branched_to = BranchedTo(BitVecVal(addr, 64), False)
-        #         else:
-        #             # the branch is not takes, do nothing
-        #             pass
-        #     else:
-        #         raise Exception('unresolved condition')
-        # elif op.opcode == pypcode.OpCode.RETURN:
-        #     assert len(op.inputs) == 1
-        #     addr = self.read_varnode(op.inputs[0])
-        #     branched_to = BranchedTo(addr, True)
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
@@ -372,9 +352,8 @@ class State:
             self.exec_comparison(op, comparison)
         else:
             raise Exception('no handler for opcode {}'.format(op.opcode))
-        # return ExecPcodeOpRes(branched_to)
 
-    def substitute(self, expr: ExprRef, read_single_mem_byte: Callable[[int], int], *substitutions):
+    def substitute(self, expr: BitVecRef, read_single_mem_byte: Callable[[int], int], *substitutions):
         expr = substitute(expr, *substitutions)
         while True:
             did_anything = False
@@ -386,8 +365,8 @@ class State:
                 var_id = int(var_name[len(prefix):])
                 mem_addr_expr = self.mem_var_addresses[var_id]
                 mem_addr_expr = simplify(substitute(mem_addr_expr, *substitutions))
-                if isinstance(mem_addr_expr, BitVecNumRef):
-                    mem_addr = mem_addr_expr.as_long()
+                mem_addr = try_expr_to_concrete(mem_addr_expr)
+                if mem_addr != None:
                     assert var.size() == 8
                     mem_byte_value = read_single_mem_byte(mem_addr)
                     expr = substitute(expr, (var, BitVecVal(mem_byte_value, 8)))
@@ -398,51 +377,81 @@ class State:
         expr = simplify(expr)
         return expr
 
-    def exec_single_insn(self, code: bytes, base_addr: int) -> List[Successor]:
-        tx = self.ctx.translate(code,base_address=base_addr)
+    def exec_single_insn(self, code: bytes, code_addr: int) -> List[Successor]:
+        tx = self.ctx.translate(code,base_address=code_addr)
         branched_to = None
         assert len(tx.ops) > 0
         imark_op = tx.ops[0]
         assert imark_op.opcode == pypcode.OpCode.IMARK
-        assert imark_op.inputs[0].offset == base_addr
+        assert imark_op.inputs[0].offset == code_addr
+        next_insn_addr = code_addr + imark_op.inputs[0].size
+        return self.exec_pcode_ops(tx.ops, next_insn_addr)
 
-        for i, op in enumerate(tx.ops):
-            if op.opcode == pypcode.OpCode.IMARK:
-                if i == 0:
-                    # we already looked at this pcode insn before the loop, ignore it
-                    continue
-                else:
-                    # we reached the next instruction, don't execute it
-                    break
-            elif op.opcode == pypcode.OpCode.BRANCH:
+    def add_constraint(self, constraint: BoolRef):
+        self.constraints.append(constraint)
+        self.solver.add(constraint)
+
+    def exec_pcode_ops(self, ops: List[pypcode.Instruction], next_insn_addr: int) -> List[Successor]:
+        for i, op in enumerate(ops):
+            if op.opcode == pypcode.OpCode.BRANCH:
                 assert len(op.inputs) == 1
                 addr_varnode = op.inputs[0]
                 assert addr_varnode.space.name == 'ram'
                 addr = addr_varnode.offset
                 return [Successor(self, BitVecVal(addr, 64), True, False)]
+            elif op.opcode == pypcode.OpCode.BRANCHIND:
+                assert len(op.inputs) == 1
+                addr = self.read_varnode(op.inputs[0])
+                return [Successor(self, addr, True, False)]
             elif op.opcode == pypcode.OpCode.CBRANCH:
                 assert len(op.inputs) == 2
                 addr_varnode = op.inputs[0]
                 assert addr_varnode.space.name == 'ram'
                 addr = addr_varnode.offset
-                cond_expr = self.read_varnode(op.inputs[1])
-                if isinstance(cond_expr, BitVecNumRef):
-                    cond = cond_expr.as_long()
-                    assert cond == 0 or cond == 1
-                    if cond != 0:
-                        return [Successor(self, BitVecVal(addr, 64), True, False)]
-                    else:
-                        # the branch is not taken, continue to the next pcode insn
-                        continue
-                else:
-                    raise Exception('unresolved condition')
+                cond_value_expr = self.read_varnode(op.inputs[1])
+
+                # check if the condition is certainly false
+                cond_true_solve_result = solver.check(cond_value_expr != 0)
+                if cond_true_solve_result == unsat:
+                    # if the condition being true is unsatisfied, the condition is known to be false.
+                    # thus, the branch is not taken, so continue to the next pcode insn.
+                    continue
+
+                # here, the condition being true is satisfiable, so it **might** be true, but we don't know if it is true or unconstrained.
+                # so, we must perform some other check to determine if it is certainly true.
+
+                cond_false_solve_result = solver.check(cond_value_expr == 0)
+                if cond_false_solve_result == unsat:
+                    # if the condition being false is unsatisfied, the condition is known to be true.
+                    # thus, the branch is taken.
+                    return [Successor(self, BitVecVal(addr, 64), True, False)]
+
+                # here, we know that the condition is unconstrained - may be true and may be false, so take both branches.
+                branch_taken_state = self.copy()
+                branch_taken_state.add_constraint(cond_value_expr != 0)
+                branch_taken_successor = Successor(branch_taken_state, BitVecVal(addr, 64), True, False)
+
+                branch_not_taken_successors = self.exec_pcode_ops(ops[i+1:], next_insn_addr)
+                return branch_not_taken_successors + [branch_taken_successor]
+
             elif op.opcode == pypcode.OpCode.RETURN:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
                 return [Successor(self, addr, True, True)]
                 
             self.exec_pcode_op(op)
-        return [Successor(self, BitVecVal(base_addr + imark_op.inputs[0].size, 64), False, False)]
+        return [Successor(self, BitVecVal(next_insn_addr, 64), False, False)]
+
+    def exec_single_insn_from_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> List[Successor]:
+        insn_bytes = dumpfile_reader.read(address, X86_MAX_INSN_LEN)
+
+        # debug
+        cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
+        print('executing insn {} {} {}'.format(hex(address), insn_mnemonic, insn_op_str))
+        # debug
+
+        return self.exec_single_insn(insn_bytes, address)
 
     @property
     def regs(self) -> StateRegs:
@@ -458,10 +467,76 @@ class StateRegs:
         raise Exception('no register named {}'.format(name))
     
 
-def expr_to_concrete(expr: ExprRef) -> int:
+def expr_to_concrete(expr: BitVecRef) -> int:
     assert isinstance(expr, BitVecNumRef), 'expression {} is not a concrete value, its type is {}'.format(expr, type(expr))
     return expr.as_long()
+
+def try_expr_to_concrete(expr: BitVecRef) -> Optional[int]:
+    if not isinstance(expr, BitVecNumRef):
+        return None
+    return expr.as_long()
+
+
+@dataclass
+class ActiveState:
+    state: State
+    next_insn_addr: int
+
+@dataclass
+class UnconstrainedState:
+    state: State
+    next_insn_addr: BitVecRef
+
+class SimManager:
+    def __init__(self, dumpfile_reader: MinidumpFileReader, initial_state: State, first_insn_addr: int):
+        self.dumpfile_reader = dumpfile_reader
+        self.active = [ActiveState(initial_state, first_insn_addr)]
+        self.unconstrained = []
+
+    def run(self):
+        while not self.finished():
+            self.step()
+
+    def finished(self):
+        return len(self.active) == 0
+
+    def step(self):
+        new_active = []
+        for active_state in self.active:
+            successors = active_state.state.exec_single_insn_from_dump_file(
+                self.dumpfile_reader,
+                active_state.next_insn_addr
+            )
+            for i, successor in enumerate(successors):
+                new_state = active_state.state
+                if i > 0:
+                    # all successors should copy the state, except for the first one which uses the original state
+                    # to avoid excess copying.
+                    new_state = new_state.copy()
+
+                next_insn_addr_concrete = try_expr_to_concrete(successor.next_insn_addr)
+                if next_insn_addr_concrete == None:
+                    # next address is unconstrained
+                    self.unconstrained.append(UnconstrainedState(new_state, successor.next_insn_addr))
+                else:
+                    # next address is concrete
+                    new_active.append(ActiveState(new_state, next_insn_addr_concrete))
+        self.active = new_active
+
     
+
+def exec_dump_file_with_manager():
+    state = State()
+    dump = MinidumpFile.parse(DUMP_FILE_PATH)
+    dump_reader = dump.get_reader()
+    pushed_magic = BitVec('pushed_magic', 64)
+    state.write_mem(MemAccess(state.regs.rsp + 8, 8), pushed_magic)
+    simgr = SimManager(dump_reader, state,VIRT_ENTRY_POINT_ADDR)
+    simgr.run()
+    embed()
+    # cur_addr = VIRT_ENTRY_POINT_ADDR
+    # pushed_magic_example_value = BitVecVal(0x4141414141414141, 64)
+    # pushed_magic_example_value = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
 
 def exec_dump_file():
     state = State()
@@ -499,10 +574,5 @@ def exec_dump_file():
         else:
             cur_addr = expr_to_concrete(successor.next_insn_addr)
 
-def quick():
-    state = State()
-    state.exec_single_insn(b"\x50\x48\x31\x1C\x24\x59", 0)
-    print(statesuccessor.next_insn_addr.rcx)
-
-# quick()
-exec_dump_file()
+# exec_dump_file()
+exec_dump_file_with_manager()
