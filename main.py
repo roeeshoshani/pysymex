@@ -358,8 +358,11 @@ class State:
     def substitute(self, expr: BitVecRef, read_single_mem_byte: Callable[[int], int], *substitutions):
         expr = substitute(expr, *substitutions)
         while True:
+            print('subbing')
             did_anything = False
-            for var in z3util.get_vars(expr):
+            cur_vars = z3util.get_vars(expr)
+            print('vars:', cur_vars)
+            for var in cur_vars:
                 prefix = MEM_VAR_NAME_PREFIX + '_'
                 var_name = var.decl().name()
                 if not var_name.startswith(prefix):
@@ -369,6 +372,7 @@ class State:
                 mem_addr_expr = simplify(substitute(mem_addr_expr, *substitutions))
                 mem_addr = try_expr_to_concrete(mem_addr_expr)
                 if mem_addr != None:
+                    print('subbed {}'.format(var_name))
                     assert var.size() == 8
                     mem_byte_value = read_single_mem_byte(mem_addr)
                     expr = substitute(expr, (var, BitVecVal(mem_byte_value, 8)))
@@ -466,9 +470,21 @@ class State:
 class StateRegs:
     state: State
     def __getattr__(self, name):
+        if name in self.__dict__:
+            return self.__dict__[name]
         for reg_name, reg_varnode in self.state.ctx.registers.items():
             if reg_name.lower() == name:
                 return self.state.read_varnode(reg_varnode)
+        raise Exception('no register named {}'.format(name))
+
+    def __setattr__(self, name, value):
+        if 'state' not in self.__dict__:
+            self.__dict__[name] = value
+            return
+        for reg_name, reg_varnode in self.state.ctx.registers.items():
+            if reg_name.lower() == name:
+                self.state.write_varnode(reg_varnode, value)
+                return
         raise Exception('no register named {}'.format(name))
     
 
@@ -528,10 +544,33 @@ class SimManager:
                     new_active.append(ActiveState(new_state, next_insn_addr_concrete))
         self.active = new_active
 
+class VmSimManager:
+    def __init__(self, pushed_magic: int):
+        self.pushed_magic = pushed_magic
+        self.pushed_magic_value_bitvec = BitVecVal(pushed_magic, 64)
+        self.pushed_magic_var = BitVec('pushed_magic', 64)
+
+        initial_state = State()
+        initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_var)
+
+        self.cur_state = initial_state
+        self.next_handler_addr = VIRT_ENTRY_POINT_ADDR
+
+    def exec_single_vm_handler(self):
+        simgr = SimManager(DUMP_READER, self.cur_state, self.next_handler_addr)
+        simgr.run()
+        assert len(simgr.unconstrained) == 1
+        final_state = simgr.unconstrained[0]
+        self.cur_state = final_state.state
+        next_handler_addr_expr = final_state.state.substitute(
+            final_state.next_insn_addr, read_dump_byte, (self.pushed_magic_var, self.pushed_magic_value_bitvec)
+        )
+        self.next_handler_addr = expr_to_concrete(next_handler_addr_expr)
+
 def read_dump_byte(addr: int) -> int:
     return DUMP_READER.read(addr, 1)[0]
     
-def get_vm_entrypoint_state(pushed_magic: BitVec) -> UnconstrainedState:
+def get_vm_entrypoint_final_state(pushed_magic: BitVec) -> UnconstrainedState:
     initial_state = State()
     initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic)
     simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
@@ -539,23 +578,68 @@ def get_vm_entrypoint_state(pushed_magic: BitVec) -> UnconstrainedState:
     assert len(simgr.unconstrained) == 1
     return simgr.unconstrained[0]
 
-def calculate_vm_state():
+def calculate_vm_state_structure():
     pushed_magic = BitVec('pushed_magic', 64)
-    vm_ep_state = get_vm_entrypoint_state(pushed_magic)
-    print(vm_ep_state.state.regs.rsp)
+    vm_ep_state = get_vm_entrypoint_final_state(pushed_magic)
 
-    for i in range(65):
-        addr = BitVec('orig_rsp', 64) - (i*8)
+    # r8 points to the VM state, which is constructed on the stack.
+    state_addr = vm_ep_state.state.regs.r8
+    orig_rsp = BitVec('orig_rsp', 64)
+    # r8 = rsp - X
+    # where X is the size of the VM state.
+    # to calculate X, we do:
+    # rsp - r8 = rsp - (rsp - X) = rsp - rsp + X = X
+    state_size = expr_to_concrete(simplify(orig_rsp - state_addr))
+    print('state size = {}'.format(hex(state_size)))
+
+    for i in range(state_size // 8):
+        addr = simplify(state_addr + (i*8))
         mem_access = MemAccess(addr, 8)
         if not vm_ep_state.state.was_entire_mem_written_to(mem_access):
             continue
         qword = vm_ep_state.state.read_mem(mem_access)
-        print('mem[RSP - {}] = {}'.format(hex(i*8), qword))
+        print('mem[R8 + {}] = {}'.format(hex(i*8), qword))
 
-    # res = vm_ep_state.state.substitute(vm_ep_state.next_insn_addr, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
-    # print(res)
+    print('final R8 = {}'.format(vm_ep_state.state.regs.r8))
+
+def get_vm_first_handler_addr(pushed_magic: int):
+    pushed_magic_var = BitVec('pushed_magic', 64)
+    vm_ep_state = get_vm_entrypoint_final_state(pushed_magic_var)
+    handler_addr_expr = vm_ep_state.state.substitute(
+        vm_ep_state.next_insn_addr, read_dump_byte, (pushed_magic_var, BitVecVal(pushed_magic, 64))
+    )
+    return expr_to_concrete(handler_addr_expr)
+
+def get_vm_handler_final_state(addr: int) -> UnconstrainedState:
+    initial_state = State()
+    simgr = SimManager(DUMP_READER, initial_state, addr)
+    simgr.run()
+    assert len(simgr.unconstrained) == 1
+    return simgr.unconstrained[0]
+
+def explore_ep_final_state():
+    pushed_magic = BitVec('pushed_magic', 64)
+    final_state = get_vm_entrypoint_final_state(pushed_magic)
+
+    print(final_state.state.regs.r9)
+    r9 = final_state.state.substitute(final_state.state.regs.r9, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
+    print(r9)
+
+def shit():
+    vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+    vm_simgr.exec_single_vm_handler()
+    print(hex(vm_simgr.next_handler_addr))
+    vm_simgr.exec_single_vm_handler()
+    print(hex(vm_simgr.next_handler_addr))
+
+    # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
+    # final_state = get_vm_handler_final_state(handler_addr)
+    # print(final_state.next_insn_addr)
+    # print(z3util.get_vars(final_state.next_insn_addr))
 
 def main():
-    calculate_vm_state()
+    shit()
+    # explore_ep_final_state()
+    # calculate_vm_state_structure()
 
 main()
