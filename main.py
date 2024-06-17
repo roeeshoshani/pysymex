@@ -184,6 +184,17 @@ class State:
             # multi byte
             return simplify(self.read_multibyte_mem(access))
 
+    def was_entire_mem_written_to(self, access: MemAccess) -> BitVecRef:
+        single_byte_values = []
+        for rel_byte_off in range(access.size_in_bytes):
+            addr = access.addr + rel_byte_off
+            # simplify the address before trying to access the dictionary.
+            # this is important since simplification makes the expression deterministic.
+            addr = simplify(addr)
+            if addr not in self.mem_values:
+                return False
+        return True
+
     def write_varnode_single_byte(self, addr: VarnodeAddr, value: BitVecRef):
         assert value.size() == 8
         self.varnode_values[addr] = value
@@ -528,10 +539,23 @@ def get_vm_entrypoint_state(pushed_magic: BitVec) -> UnconstrainedState:
     assert len(simgr.unconstrained) == 1
     return simgr.unconstrained[0]
 
-def main():
+def calculate_vm_state():
     pushed_magic = BitVec('pushed_magic', 64)
     vm_ep_state = get_vm_entrypoint_state(pushed_magic)
-    res = vm_ep_state.state.substitute(vm_ep_state.next_insn_addr, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
-    print(res)
+    print(vm_ep_state.state.regs.rsp)
+
+    for i in range(65):
+        addr = BitVec('orig_rsp', 64) - (i*8)
+        mem_access = MemAccess(addr, 8)
+        if not vm_ep_state.state.was_entire_mem_written_to(mem_access):
+            continue
+        qword = vm_ep_state.state.read_mem(mem_access)
+        print('mem[RSP - {}] = {}'.format(hex(i*8), qword))
+
+    # res = vm_ep_state.state.substitute(vm_ep_state.next_insn_addr, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
+    # print(res)
+
+def main():
+    calculate_vm_state()
 
 main()
