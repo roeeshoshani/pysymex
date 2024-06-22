@@ -588,8 +588,9 @@ class State:
     def read_single_byte_from_mem_or_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> int:
         addr_bitvec = BitVecVal(address, 64)
         if addr_bitvec in self.mem_values:
-            expr = self.read_mem(MemAccess(addr_bitvec, 1))
-            return expr_to_concrete(expr)
+            raise Exception('self modifying code')
+            # expr = self.read_mem(self.mem_values[addr_bitvec])
+            # return expr_to_concrete(expr)
         else:
             return dumpfile_reader.read(address, 1)[0]
 
