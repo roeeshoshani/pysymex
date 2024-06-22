@@ -16,6 +16,7 @@ VIRT_ENTRY_POINT_ADDR = 0x00d6bd08
 X86_MAX_INSN_LEN = 15
 EXAMPLE_PUSHED_MAGIC = 0x6bfd0737
 MEM_VAR_NAME_PREFIX = 'orig_mem'
+EMPTY_SOLVER = Solver()
 
 DUMP_FILE = MinidumpFile.parse(DUMP_FILE_PATH)
 DUMP_READER = DUMP_FILE.get_reader()
@@ -64,6 +65,9 @@ def are_concretely_equal(solver: Solver, a: BitVecRef, b: BitVecRef) -> bool:
         return False
     return solver.check(a != b) == unsat
 
+def are_constraints_concretely_equal(solver: Solver, a: BoolRef, b: BoolRef) -> bool:
+    return solver.check(a != b) == unsat
+
 def simplify_concat_extract(solver: Solver, single_byte_values: List[BitVecRef]) -> List[BitVecRef]:
     if len(single_byte_values) == 1:
         return single_byte_values
@@ -103,6 +107,55 @@ class State:
         new_state.solver = copy_solver(self.solver)
         new_state.read_mem_single_byte_fallback = self.read_mem_single_byte_fallback
         return new_state
+
+    def has_constraint(self, constraint: BoolRef) -> bool:
+        for cur_constraint in self.constraints:
+            if are_constraints_concretely_equal(EMPTY_SOLVER, constraint, cur_constraint):
+                return True
+        return False
+
+    def shared_constraints_with(self, other: State) -> List[BoolRef]:
+        res = []
+        for self_constraint in self.constraints:
+            if other.has_constraint(self_constraint):
+                res.append(self_constraint)
+        return res
+
+    def is_same_as(self, other: State) -> bool:
+        """
+        checks if this state is the same as the given other state.
+        this means that all varnode and memory values are the same.
+        the states are considered the same even if they differ in their constraints.
+        """
+        if not self.varnode_values.keys() == other.varnode_values.keys():
+            return False
+
+        for k in self.varnode_values.keys():
+            if not are_concretely_equal(EMPTY_SOLVER, self.varnode_values[k], other.varnode_values[k]):
+                return False
+
+        if len(self.mem_var_addresses) != len(other.mem_var_addresses):
+            return False
+        for self_addr, other_addr in zip(self.mem_var_addresses, other.mem_var_addresses):
+            if not are_concretely_equal(EMPTY_SOLVER, self_addr, other_addr):
+                return False
+
+        if len(self.mem_values) != len(other.mem_values):
+            return False
+
+        for mem_value_addr in self.mem_values.keys():
+            if mem_value_addr not in other.mem_values:
+                return False
+            if not are_concretely_equal(EMPTY_SOLVER, self.mem_values[mem_value_addr], other.mem_values[mem_value_addr]):
+                return False
+
+        for mem_value_addr in other.mem_values.keys():
+            if mem_value_addr not in self.mem_values:
+                return False
+            if not are_concretely_equal(EMPTY_SOLVER, self.mem_values[mem_value_addr], other.mem_values[mem_value_addr]):
+                return False
+        return True
+            
 
     def set_read_mem_single_byte_fallback(self, fn: Callable[[int], Optional[int]]):
         self.read_mem_single_byte_fallback = fn
@@ -584,6 +637,14 @@ class ActiveState:
     state: State
     next_insn_addr: int
 
+    def is_same_as(self, other: ActiveState) -> bool:
+        """
+        checks if this state is the same as the given other state.
+        this means that all varnode and memory values are the same, and the next instruction to be executed is also the same.
+        the states are considered the same even if they differ in their constraints.
+        """
+        return self.next_insn_addr == other.next_insn_addr and self.state.is_same_as(other.state)
+
 @dataclass
 class UnconstrainedState:
     state: State
@@ -593,6 +654,29 @@ class UnconstrainedState:
 class StepOptions:
     allow_indirect_branches: bool
 
+class ActiveStatesSet:
+    def __init__(self):
+        self.states = []
+
+    def append_state(self, new_active_state: ActiveState):
+        for cur_state_index in range(len(self.states)):
+            cur_active_state = self.states[cur_state_index]
+            if not new_active_state.is_same_as(cur_active_state):
+                continue
+            # the two states are the same, but may have different constraints. keep only the shared constraints
+            # and combine them into a single state.
+            shared_constraints = new_active_state.state.shared_constraints_with(cur_active_state.state)
+            shared_constraints_solver = Solver()
+            for constraint in shared_constraints:
+                shared_constraints_solver.add(constraint)
+            combined_state = new_active_state.state.copy()
+            combined_state.constraints = shared_constraints
+            combined_state.solver = shared_constraints_solver
+            self.states[cur_state_index] = ActiveState(combined_state, new_active_state.next_insn_addr)
+
+            # we combined the states, so we are done adding the new state
+            return
+        self.states.append(new_active_state)
 
 class SimManager:
     def __init__(self, dumpfile_reader: MinidumpFileReader, initial_state: State, first_insn_addr: int):
@@ -608,7 +692,7 @@ class SimManager:
         return len(self.active) == 0
 
     def step(self, opts: StepOptions):
-        new_active = []
+        new_active = ActiveStatesSet()
         for active_state in self.active:
             successors = active_state.state.exec_single_insn_from_dump_file(
                 self.dumpfile_reader,
@@ -627,8 +711,8 @@ class SimManager:
                     self.unconstrained.append(UnconstrainedState(new_state, successor.next_insn_addr))
                 else:
                     # next address is concrete
-                    new_active.append(ActiveState(new_state, next_insn_addr_concrete))
-        self.active = new_active
+                    new_active.append_state(ActiveState(new_state, next_insn_addr_concrete))
+        self.active = new_active.states
 
 class VmSimManager:
     def __init__(self, pushed_magic: int):
