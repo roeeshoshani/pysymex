@@ -849,8 +849,9 @@ class VmSimManager:
         self.simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
 
     def exec_single_vm_handler(self):
-        for active_state in self.simgr.active:
+        for i, active_state in enumerate(self.simgr.active):
             active_state.state.reset_mem_write_tracking()
+            print('ABOUT TO STEP STATE {} STARTING AT ADDR {}'.format(i, hex(active_state.next_insn_addr)))
         self.simgr.run(StepOptions(allow_indirect_branches=False))
         assert len(self.simgr.unconstrained) == 0
         assert len(self.simgr.stopped) > 0
@@ -864,6 +865,9 @@ class VmSimManager:
                 print('VALUE = {}'.format(tracked_write.value))
                 print()
             print('===========')
+
+        print()
+        print()
 
         # re-activate the stopped states
         self.simgr.active = self.simgr.stopped
@@ -938,8 +942,7 @@ def explore_ep_final_state():
 
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    for i in range(4):
-        print('INSN')
+    for i in range(20):
         vm_simgr.exec_single_vm_handler()
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
