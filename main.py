@@ -23,7 +23,7 @@ DUMP_READER = DUMP_FILE.get_reader()
 
 @dataclass(frozen=True)
 class VarnodeAddr:
-    space: pypcode.AddrSpace
+    space_name: str
     off: int
 
 @dataclass(frozen=True)
@@ -162,7 +162,7 @@ class State:
 
     def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
         for reg_name, reg_varnode in self.ctx.registers.items():
-            if reg_varnode.space != addr.space:
+            if reg_varnode.space.name != addr.space_name:
                 continue
             reg_start_off = reg_varnode.offset
             reg_end_off = reg_start_off + reg_varnode.size
@@ -196,7 +196,7 @@ class State:
     def read_non_const_multibyte_varnode(self, varnode: pypcode.Varnode) -> BitVecRef:
         single_byte_values = []
         for rel_byte_off in range(varnode.size):
-            addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
+            addr = VarnodeAddr(varnode.space.name, varnode.offset + rel_byte_off)
             single_byte_values.append(self.read_varnode_single_byte(addr))
         single_byte_values.reverse()
         single_byte_values = simplify_concat_extract(self.solver, single_byte_values)
@@ -208,7 +208,7 @@ class State:
     def read_non_const_varnode(self, varnode: pypcode.Varnode) -> BitVecRef:
         if varnode.size == 1:
             # single byte
-            addr = VarnodeAddr(varnode.space, varnode.offset)
+            addr = VarnodeAddr(varnode.space.name, varnode.offset)
             return self.read_varnode_single_byte(addr)
         else:
             # multi byte
@@ -284,7 +284,7 @@ class State:
         assert value.size() == varnode.size * BITS_PER_BYTE
         value = simplify(value)
         for rel_byte_off in range(varnode.size):
-            addr = VarnodeAddr(varnode.space, varnode.offset + rel_byte_off)
+            addr = VarnodeAddr(varnode.space.name, varnode.offset + rel_byte_off)
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_varnode_single_byte(addr, extracted_byte)
@@ -585,8 +585,19 @@ class State:
             self.exec_pcode_op(op)
         return [Successor(self, BitVecVal(next_insn_addr, 64), False, False, False)]
 
+    def read_single_byte_from_mem_or_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> int:
+        addr_bitvec = BitVecVal(address, 64)
+        if addr_bitvec in self.mem_values:
+            expr = self.read_mem(MemAccess(addr_bitvec, 1))
+            return expr_to_concrete(expr)
+        else:
+            return dumpfile_reader.read(address, 1)[0]
+
     def exec_single_insn_from_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> List[Successor]:
-        insn_bytes = dumpfile_reader.read(address, X86_MAX_INSN_LEN)
+        insn_single_bytes = []
+        for cur_addr in range(address, address + X86_MAX_INSN_LEN):
+            insn_single_bytes.append(self.read_single_byte_from_mem_or_dump_file(dumpfile_reader, cur_addr))
+        insn_bytes = bytes(insn_single_bytes)
 
         # debug
         cs = Cs(CS_ARCH_X86, CS_MODE_64)
