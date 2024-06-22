@@ -904,6 +904,14 @@ class VmSimManager:
         initial_state = State()
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
         initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec, None)
+
+        # some conditions can have weird results if `rsp` is close to one of the ends of the address space,
+        # so make sure that it isn't.
+        rsp_distance_from_ends_of_address_space = 0x16000
+        min_rsp = rsp_distance_from_ends_of_address_space
+        max_rsp = 2**64 - rsp_distance_from_ends_of_address_space
+        initial_state.add_constraint(UGE(initial_state.regs.rsp, BitVecVal(min_rsp, 64)))
+        initial_state.add_constraint(ULT(initial_state.regs.rsp, BitVecVal(max_rsp, 64)))
         initial_state.enable_mem_write_tracking()
 
         self.simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
@@ -1002,7 +1010,7 @@ def explore_ep_final_state():
 
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    for i in range(22):
+    for i in range(28):
         vm_simgr.exec_single_vm_handler()
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
