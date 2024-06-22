@@ -506,6 +506,14 @@ class State:
         expr = simplify(expr)
         return expr
 
+    def cleanup_unique_varnodes(self):
+        addrs_to_delete = []
+        for addr in self.varnode_values.keys():
+            if addr.space_name == 'unique':
+                addrs_to_delete.append(addr)
+        for addr in addrs_to_delete:
+            del self.varnode_values[addr]
+
     def exec_single_insn(self, code: bytes, code_addr: int) -> List[Successor]:
         tx = self.ctx.translate(code,base_address=code_addr)
         branched_to = None
@@ -514,7 +522,10 @@ class State:
         assert imark_op.opcode == pypcode.OpCode.IMARK
         assert imark_op.inputs[0].offset == code_addr
         next_insn_addr = code_addr + imark_op.inputs[0].size
-        return self.exec_pcode_ops(tx.ops, 1, next_insn_addr)
+        successors = self.exec_pcode_ops(tx.ops, 1, next_insn_addr)
+        for successor in successors:
+            successor.state.cleanup_unique_varnodes()
+        return successors
 
     def add_constraint(self, constraint: BoolRef):
         self.constraints.append(constraint)
@@ -710,6 +721,7 @@ class ActiveStatesSet:
             cur_active_state = self.states[cur_state_index]
             if not new_active_state.is_same_as(cur_active_state):
                 continue
+
             # the two states are the same, but may have different constraints. keep only the shared constraints
             # and combine them into a single state.
             shared_constraints = new_active_state.state.shared_constraints_with(cur_active_state.state)
@@ -740,7 +752,8 @@ class SimManager:
 
     def step(self, opts: StepOptions):
         new_active = ActiveStatesSet()
-        for active_state in self.active:
+        for state_index, active_state in enumerate(self.active):
+            print('STEPPING STATE {}'.format(state_index))
             successors = active_state.state.exec_single_insn_from_dump_file(
                 self.dumpfile_reader,
                 active_state.next_insn_addr
@@ -777,10 +790,10 @@ class VmSimManager:
     def exec_single_vm_handler(self):
         simgr = SimManager(DUMP_READER, self.cur_state, self.next_handler_addr)
         simgr.run(StepOptions(False))
-        if len(simgr.unconstrained) > 1:
-            print('MULTIPLE STATES')
-            embed()
-        assert len(simgr.unconstrained) == 1
+        # if len(simgr.unconstrained) > 1:
+        #     print('MULTIPLE STATES')
+        #     embed()
+        assert len(simgr.unconstrained) > 0
         final_state = simgr.unconstrained[0]
         self.cur_state = final_state.state
         next_handler_addr_expr = final_state.next_insn_addr
@@ -854,10 +867,20 @@ def explore_ep_final_state():
     print(r9)
 
 def shit():
-    vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    while True:
-        vm_simgr.exec_single_vm_handler()
-        print(hex(vm_simgr.next_handler_addr))
+    pushed_magic_value_bitvec = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
+
+    initial_state = State()
+    initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
+    initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic_value_bitvec)
+
+    simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
+    simgr.run(StepOptions(True))
+    embed()
+
+    # vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+    # while True:
+    #     vm_simgr.exec_single_vm_handler()
+    #     print(hex(vm_simgr.next_handler_addr))
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
     # final_state = get_vm_handler_final_state(handler_addr)
