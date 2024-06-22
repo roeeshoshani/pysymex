@@ -7,6 +7,8 @@ from minidump.minidumpfile import MinidumpFile
 from minidump.minidumpreader import MinidumpFileReader
 from IPython import embed
 import pypcode
+import itertools
+import enum
 
 BITS_PER_BYTE = 8
 DUMP_FILE_PATH = '/home/sho/Documents/freelance/getcode/GetCode.DMP'
@@ -32,6 +34,12 @@ def bits_to_bytes_safe(bits_amount: int) -> int:
     assert bits_amount % BITS_PER_BYTE == 0
     return bits_amount // BITS_PER_BYTE
 
+class UnreachableError:
+    pass
+
+def unreachable():
+    raise UnreachableError()
+
 @dataclass
 class Successor:
     state: State
@@ -39,6 +47,11 @@ class Successor:
     is_branch: bool
     is_return: bool
     is_indirect_branch: bool
+
+class ResolvedCondition(enum.Enum):
+    FALSE = 0
+    TRUE = 1
+    UNKNOWN = 2
 
 def is_extract(expr: BitVecRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
@@ -413,23 +426,48 @@ class State:
         assert imark_op.opcode == pypcode.OpCode.IMARK
         assert imark_op.inputs[0].offset == code_addr
         next_insn_addr = code_addr + imark_op.inputs[0].size
-        return self.exec_pcode_ops(tx.ops[1:], next_insn_addr)
+        return self.exec_pcode_ops(tx.ops, 1, next_insn_addr)
 
     def add_constraint(self, constraint: BoolRef):
         self.constraints.append(constraint)
         self.solver.add(constraint)
 
-    def exec_pcode_ops(self, ops: List[pypcode.Instruction], next_insn_addr: int) -> List[Successor]:
-        for i, op in enumerate(ops):
+    def resolve_condition(self, cond_value_expr: ExprRef) -> ResolvedCondition:
+        # check if the condition is certainly false
+        cond_true_solve_result = self.solver.check(cond_value_expr != 0)
+        if cond_true_solve_result == unsat:
+            # if the condition being true is unsatisfied, the condition is known to be false.
+            return ResolvedCondition.FALSE
+
+        # here, the condition being true is satisfiable, so it **might** be true, but we don't know if it is true or unconstrained.
+        # so, we must perform some other check to determine if it is certainly true.
+
+        cond_false_solve_result = self.solver.check(cond_value_expr == 0)
+        if cond_false_solve_result == unsat:
+            # if the condition being false is unsatisfied, the condition is known to be true.
+            return ResolvedCondition.TRUE
+
+        # here, we know that the condition is unknown - may be true and may be false.
+        return ResolvedCondition.UNKNOWN
+
+    def exec_pcode_ops(self, ops: List[pypcode.Instruction], first_op_index: int, next_insn_addr: int) -> List[Successor]:
+        for i, op in itertools.islice(enumerate(ops), first_op_index, None):
             if op.opcode == pypcode.OpCode.IMARK:
-                # reached a second IMARK, so this is no longer the first instruction. stop executing.
-                break
+                if i == 0:
+                    # this is the imark of the current instruction, ignore it
+                    continue
+                else:
+                    # reached a second IMARK, so this is no longer the first instruction. stop executing.
+                    break
             elif op.opcode == pypcode.OpCode.BRANCH:
                 assert len(op.inputs) == 1
                 addr_varnode = op.inputs[0]
-                assert addr_varnode.space.name == 'ram'
-                addr = addr_varnode.offset
-                return [Successor(self, BitVecVal(addr, 64), True, False, False)]
+                if addr_varnode.space.name == 'ram':
+                    addr = addr_varnode.offset
+                    return [Successor(self, BitVecVal(addr, 64), True, False, False)]
+                else:
+                    assert addr_varnode.space.name == 'const'
+                    return self.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
             elif op.opcode == pypcode.OpCode.BRANCHIND:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
@@ -437,37 +475,54 @@ class State:
             elif op.opcode == pypcode.OpCode.CBRANCH:
                 assert len(op.inputs) == 2
                 addr_varnode = op.inputs[0]
-                assert addr_varnode.space.name == 'ram'
-                addr = addr_varnode.offset
                 cond_value_expr = self.read_varnode(op.inputs[1])
+                resolved_condition = self.resolve_condition(cond_value_expr)
 
-                # check if the condition is certainly false
-                cond_true_solve_result = self.solver.check(cond_value_expr != 0)
-                if cond_true_solve_result == unsat:
-                    # if the condition being true is unsatisfied, the condition is known to be false.
-                    # thus, the branch is not taken, so continue to the next pcode insn.
-                    continue
+                if addr_varnode.space.name == 'ram':
+                    addr = addr_varnode.offset
+                    if resolved_condition == ResolvedCondition.FALSE:
+                        # the branch is not taken, so continue to the next pcode insn.
+                        continue
+                    elif resolved_condition == ResolvedCondition.TRUE:
+                        # the branch is taken.
+                        return [Successor(self, BitVecVal(addr, 64), True, False, False)]
+                    elif resolved_condition == ResolvedCondition.UNKNOWN:
+                        # here, we know that the condition is unknown - may be true and may be false, so take both branches.
 
-                # here, the condition being true is satisfiable, so it **might** be true, but we don't know if it is true or unconstrained.
-                # so, we must perform some other check to determine if it is certainly true.
+                        # generate the successor for the case where the branch is taken.
+                        branch_taken_state = self.copy()
+                        branch_taken_state.add_constraint(cond_value_expr != 0)
+                        branch_taken_successor = Successor(branch_taken_state, BitVecVal(addr, 64), True, False, False)
 
-                cond_false_solve_result = self.solver.check(cond_value_expr == 0)
-                if cond_false_solve_result == unsat:
-                    # if the condition being false is unsatisfied, the condition is known to be true.
-                    # thus, the branch is taken.
-                    return [Successor(self, BitVecVal(addr, 64), True, False, False)]
+                        # generate the successors for the case where the branch is **not** taken.
+                        self.add_constraint(cond_value_expr == 0)
+                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, next_insn_addr)
+                        return branch_not_taken_successors + [branch_taken_successor]
+                    else:
+                        unreachable()
+                else:
+                    # handle a pcode relative branch
+                    assert addr_varnode.space.name == 'const'
+                    if resolved_condition == ResolvedCondition.FALSE:
+                        # the branch is not taken, so continue to the next pcode insn.
+                        continue
+                    elif resolved_condition == ResolvedCondition.TRUE:
+                        # the branch is taken.
+                        return self.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
+                    elif resolved_condition == ResolvedCondition.UNKNOWN:
+                        # here, we know that the condition is unknown - may be true and may be false, so take both branches.
 
-                # here, we know that the condition is unconstrained - may be true and may be false, so take both branches.
+                        # generate the successors for the case where the branch is taken.
+                        branch_taken_state = self.copy()
+                        branch_taken_state.add_constraint(cond_value_expr != 0)
+                        branch_taken_successors = branch_taken_state.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
 
-                # generate the successor for the case where the branch is taken.
-                branch_taken_state = self.copy()
-                branch_taken_state.add_constraint(cond_value_expr != 0)
-                branch_taken_successor = Successor(branch_taken_state, BitVecVal(addr, 64), True, False, False)
-
-                # generate the successor for the case where the branch is **not** taken.
-                self.add_constraint(cond_value_expr == 0)
-                branch_not_taken_successors = self.exec_pcode_ops(ops[i+1:], next_insn_addr)
-                return branch_not_taken_successors + [branch_taken_successor]
+                        # generate the successors for the case where the branch is **not** taken.
+                        self.add_constraint(cond_value_expr == 0)
+                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, next_insn_addr)
+                        return branch_not_taken_successors + branch_taken_successors
+                    else:
+                        unreachable()
 
             elif op.opcode == pypcode.OpCode.RETURN:
                 assert len(op.inputs) == 1
@@ -591,6 +646,9 @@ class VmSimManager:
     def exec_single_vm_handler(self):
         simgr = SimManager(DUMP_READER, self.cur_state, self.next_handler_addr)
         simgr.run(StepOptions(False))
+        if len(simgr.unconstrained) > 1:
+            print('MULTIPLE STATES')
+            embed()
         assert len(simgr.unconstrained) == 1
         final_state = simgr.unconstrained[0]
         self.cur_state = final_state.state
