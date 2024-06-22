@@ -38,6 +38,7 @@ class Successor:
     next_insn_addr: BitVecRef
     is_branch: bool
     is_return: bool
+    is_indirect_branch: bool
 
 def is_extract(expr: BitVecRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
@@ -78,6 +79,7 @@ class State:
         self.mem_var_addresses = []
         self.constraints = []
         self.solver = Solver()
+        self.read_mem_single_byte_fallback = None
 
     def copy(self):
         new_state = State()
@@ -86,7 +88,11 @@ class State:
         new_state.mem_var_addresses = self.mem_var_addresses.copy()
         new_state.constraints = self.constraints.copy()
         new_state.solver = copy_solver(self.solver)
+        new_state.read_mem_single_byte_fallback = self.read_mem_single_byte_fallback
         return new_state
+
+    def set_read_mem_single_byte_fallback(self, fn: Callable[[int], Optional[int]]):
+        self.read_mem_single_byte_fallback = fn
 
     def get_reg_name_containting_addr(self, addr: VarnodeAddr) -> Optional[str]:
         for reg_name, reg_varnode in self.ctx.registers.items():
@@ -148,6 +154,20 @@ class State:
         else:
             return simplify(self.read_non_const_varnode(varnode))
 
+    def read_mem_single_byte_uninit(self, addr: BitVecRef) -> BitVecRef:
+        # if the address is concrete, try using the fallback function
+        concrete_addr = try_expr_to_concrete(addr)
+        if concrete_addr != None and self.read_mem_single_byte_fallback != None:
+            value = (self.read_mem_single_byte_fallback)(concrete_addr)
+            if value != None:
+                return BitVecVal(value, 8)
+
+        # value is uninitialized, need to initialize it with a variable
+        mem_var_id = len(self.mem_var_addresses)
+        var_name = '{}_{}'.format(MEM_VAR_NAME_PREFIX, mem_var_id)
+        self.mem_var_addresses.append(addr)
+        return BitVec(var_name, 8)
+
     def read_mem_single_byte(self, addr: BitVecRef) -> BitVecRef:
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
@@ -155,14 +175,9 @@ class State:
         if addr in self.mem_values:
             return self.mem_values[addr]
         else:
-            # value is uninitialized, need to initialize it with a variable
-            # var_name = '{}[{}]'.format(MEM_VAR_NAME_PREFIX, addr)
-            mem_var_id = len(self.mem_var_addresses)
-            var_name = '{}_{}'.format(MEM_VAR_NAME_PREFIX, mem_var_id)
-            self.mem_var_addresses.append(addr)
-            var = BitVec(var_name, 8)
-            self.write_mem_single_byte(addr, var)
-            return var
+            value = self.read_mem_single_byte_uninit(addr)
+            self.write_mem_single_byte(addr, value)
+            return value
 
     def read_multibyte_mem(self, access: MemAccess) -> BitVecRef:
         single_byte_values = []
@@ -250,6 +265,14 @@ class State:
         return LShR(a, b)
 
     @staticmethod
+    def signed_shift_right(a: BitVecRef, b: BitVecRef) -> BitVecRef:
+        if b.size() > a.size():
+            b = Extract(a.size() - 1, 0, b)
+        if b.size() < a.size():
+            b = ZeroExt(a.size() - b.size(), b)
+        return a >> b
+
+    @staticmethod
     def shift_left(a: BitVecRef, b: BitVecRef) -> BitVecRef:
         if b.size() > a.size():
             b = Extract(a.size() - 1, 0, b)
@@ -267,9 +290,11 @@ class State:
             pypcode.OpCode.INT_REM: lambda a,b: URem(a,b),
             pypcode.OpCode.INT_OR: lambda a,b: a | b,
             pypcode.OpCode.INT_RIGHT: State.shift_right,
+            pypcode.OpCode.INT_SRIGHT: State.signed_shift_right,
             pypcode.OpCode.INT_LEFT: State.shift_left,
             pypcode.OpCode.BOOL_OR: lambda a,b: a | b,
             pypcode.OpCode.BOOL_XOR: lambda a,b: a ^ b,
+            pypcode.OpCode.BOOL_AND: lambda a,b: a & b,
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
@@ -358,10 +383,8 @@ class State:
     def substitute(self, expr: BitVecRef, read_single_mem_byte: Callable[[int], int], *substitutions):
         expr = substitute(expr, *substitutions)
         while True:
-            print('subbing')
             did_anything = False
             cur_vars = z3util.get_vars(expr)
-            print('vars:', cur_vars)
             for var in cur_vars:
                 prefix = MEM_VAR_NAME_PREFIX + '_'
                 var_name = var.decl().name()
@@ -372,7 +395,6 @@ class State:
                 mem_addr_expr = simplify(substitute(mem_addr_expr, *substitutions))
                 mem_addr = try_expr_to_concrete(mem_addr_expr)
                 if mem_addr != None:
-                    print('subbed {}'.format(var_name))
                     assert var.size() == 8
                     mem_byte_value = read_single_mem_byte(mem_addr)
                     expr = substitute(expr, (var, BitVecVal(mem_byte_value, 8)))
@@ -407,11 +429,11 @@ class State:
                 addr_varnode = op.inputs[0]
                 assert addr_varnode.space.name == 'ram'
                 addr = addr_varnode.offset
-                return [Successor(self, BitVecVal(addr, 64), True, False)]
+                return [Successor(self, BitVecVal(addr, 64), True, False, False)]
             elif op.opcode == pypcode.OpCode.BRANCHIND:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
-                return [Successor(self, addr, True, False)]
+                return [Successor(self, addr, True, False, True)]
             elif op.opcode == pypcode.OpCode.CBRANCH:
                 assert len(op.inputs) == 2
                 addr_varnode = op.inputs[0]
@@ -433,23 +455,27 @@ class State:
                 if cond_false_solve_result == unsat:
                     # if the condition being false is unsatisfied, the condition is known to be true.
                     # thus, the branch is taken.
-                    return [Successor(self, BitVecVal(addr, 64), True, False)]
+                    return [Successor(self, BitVecVal(addr, 64), True, False, False)]
 
                 # here, we know that the condition is unconstrained - may be true and may be false, so take both branches.
+
+                # generate the successor for the case where the branch is taken.
                 branch_taken_state = self.copy()
                 branch_taken_state.add_constraint(cond_value_expr != 0)
-                branch_taken_successor = Successor(branch_taken_state, BitVecVal(addr, 64), True, False)
+                branch_taken_successor = Successor(branch_taken_state, BitVecVal(addr, 64), True, False, False)
 
+                # generate the successor for the case where the branch is **not** taken.
+                self.add_constraint(cond_value_expr == 0)
                 branch_not_taken_successors = self.exec_pcode_ops(ops[i+1:], next_insn_addr)
                 return branch_not_taken_successors + [branch_taken_successor]
 
             elif op.opcode == pypcode.OpCode.RETURN:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
-                return [Successor(self, addr, True, True)]
+                return [Successor(self, addr, True, True, True)]
                 
             self.exec_pcode_op(op)
-        return [Successor(self, BitVecVal(next_insn_addr, 64), False, False)]
+        return [Successor(self, BitVecVal(next_insn_addr, 64), False, False, False)]
 
     def exec_single_insn_from_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> List[Successor]:
         insn_bytes = dumpfile_reader.read(address, X86_MAX_INSN_LEN)
@@ -508,20 +534,25 @@ class UnconstrainedState:
     state: State
     next_insn_addr: BitVecRef
 
+@dataclass
+class StepOptions:
+    allow_indirect_branches: bool
+
+
 class SimManager:
     def __init__(self, dumpfile_reader: MinidumpFileReader, initial_state: State, first_insn_addr: int):
         self.dumpfile_reader = dumpfile_reader
         self.active = [ActiveState(initial_state, first_insn_addr)]
         self.unconstrained = []
 
-    def run(self):
+    def run(self, opts: StepOptions):
         while not self.finished():
-            self.step()
+            self.step(opts)
 
     def finished(self):
         return len(self.active) == 0
 
-    def step(self):
+    def step(self, opts: StepOptions):
         new_active = []
         for active_state in self.active:
             successors = active_state.state.exec_single_insn_from_dump_file(
@@ -536,8 +567,8 @@ class SimManager:
                     new_state = new_state.copy()
 
                 next_insn_addr_concrete = try_expr_to_concrete(successor.next_insn_addr)
-                if next_insn_addr_concrete == None:
-                    # next address is unconstrained
+                if next_insn_addr_concrete == None or (successor.is_indirect_branch and not opts.allow_indirect_branches):
+                    # next address is unconstrained, or this successor is an indirect branch and indirect branches are not allowed
                     self.unconstrained.append(UnconstrainedState(new_state, successor.next_insn_addr))
                 else:
                     # next address is concrete
@@ -551,36 +582,44 @@ class VmSimManager:
         self.pushed_magic_var = BitVec('pushed_magic', 64)
 
         initial_state = State()
-        initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_var)
+        initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
+        initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec)
 
         self.cur_state = initial_state
         self.next_handler_addr = VIRT_ENTRY_POINT_ADDR
 
     def exec_single_vm_handler(self):
         simgr = SimManager(DUMP_READER, self.cur_state, self.next_handler_addr)
-        simgr.run()
+        simgr.run(StepOptions(False))
         assert len(simgr.unconstrained) == 1
         final_state = simgr.unconstrained[0]
         self.cur_state = final_state.state
-        next_handler_addr_expr = final_state.state.substitute(
-            final_state.next_insn_addr, read_dump_byte, (self.pushed_magic_var, self.pushed_magic_value_bitvec)
-        )
+        next_handler_addr_expr = final_state.next_insn_addr
         self.next_handler_addr = expr_to_concrete(next_handler_addr_expr)
 
 def read_dump_byte(addr: int) -> int:
     return DUMP_READER.read(addr, 1)[0]
+
+def try_read_dump_byte(addr: int) -> Optional[int]:
+    try:
+        return DUMP_READER.read(addr, 1)[0]
+    except Exception as e:
+        if 'Address not in memory range' in str(e):
+            return None
+        else:
+            raise
     
 def get_vm_entrypoint_final_state(pushed_magic: BitVec) -> UnconstrainedState:
     initial_state = State()
     initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic)
     simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
-    simgr.run()
+    simgr.run(StepOptions(True))
     assert len(simgr.unconstrained) == 1
     return simgr.unconstrained[0]
 
 def calculate_vm_state_structure():
     pushed_magic = BitVec('pushed_magic', 64)
-    vm_ep_state = get_vm_entrypoint_final_state(pushed_magic)
+    vm_ep_state = get_vm_entrypoint_final_state(try_read_dump_byte)
 
     # r8 points to the VM state, which is constructed on the stack.
     state_addr = vm_ep_state.state.regs.r8
@@ -613,7 +652,7 @@ def get_vm_first_handler_addr(pushed_magic: int):
 def get_vm_handler_final_state(addr: int) -> UnconstrainedState:
     initial_state = State()
     simgr = SimManager(DUMP_READER, initial_state, addr)
-    simgr.run()
+    simgr.run(StepOptions(True))
     assert len(simgr.unconstrained) == 1
     return simgr.unconstrained[0]
 
@@ -627,10 +666,9 @@ def explore_ep_final_state():
 
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    vm_simgr.exec_single_vm_handler()
-    print(hex(vm_simgr.next_handler_addr))
-    vm_simgr.exec_single_vm_handler()
-    print(hex(vm_simgr.next_handler_addr))
+    while True:
+        vm_simgr.exec_single_vm_handler()
+        print(hex(vm_simgr.next_handler_addr))
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
     # final_state = get_vm_handler_final_state(handler_addr)
