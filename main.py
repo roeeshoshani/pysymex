@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from minidump.minidumpfile import MinidumpFile
 from minidump.minidumpreader import MinidumpFileReader
 from IPython import embed
+from collections import defaultdict
 import pypcode
 import itertools
 import enum
@@ -60,6 +61,48 @@ class ResolvedCondition(enum.Enum):
     TRUE = 1
     UNKNOWN = 2
 
+@dataclass
+class TrackedMemWrite:
+    addr: BitVecRef
+    value: BitVecRef
+
+class TrackedMemWriteAggregator:
+    def __init__(self):
+        self.addr = None
+        self.single_byte_values = []
+
+    def track_write(self, addr: BitVecRef, value: BitVecRef):
+        if self.addr is None:
+            self.addr = addr
+            self.single_byte_values.append(value)
+            return
+        expected_addr = self.addr + len(self.single_byte_values)
+        assert are_concretely_equal(EMPTY_SOLVER, addr, expected_addr)
+        self.single_byte_values = [value] + self.single_byte_values
+
+    @property
+    def value(self) -> Optional[BitVecRef]:
+        if self.addr is None:
+            return None
+        single_byte_values = simplify_concat_extract(EMPTY_SOLVER, self.single_byte_values)
+
+        if len(single_byte_values) == 1:
+            return simplify(single_byte_values[0])
+        else:
+            return simplify(Concat(single_byte_values))
+
+    def __repr__(self) -> str:
+        return 'TrackedMemWriteAggregator(addr={}, value={})'.format(self.addr, self.value)
+
+    def __str__(self) -> str:
+        return repr(self)
+
+def get_insn_disassembly(address: int) -> str:
+    insn_bytes = DUMP_READER.read(address, X86_MAX_INSN_LEN)
+    cs = Cs(CS_ARCH_X86, CS_MODE_64)
+    insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
+    return '{} {} {}'.format(hex(address), insn_mnemonic, insn_op_str)
+
 def is_extract(expr: BitVecRef) -> bool:
     return is_app_of(expr, Z3_OP_EXTRACT)
 
@@ -103,6 +146,7 @@ class State:
         self.constraints = []
         self.solver = Solver()
         self.read_mem_single_byte_fallback = None
+        self.mem_writes = None
 
     def copy(self):
         new_state = State()
@@ -112,7 +156,16 @@ class State:
         new_state.constraints = self.constraints.copy()
         new_state.solver = copy_solver(self.solver)
         new_state.read_mem_single_byte_fallback = self.read_mem_single_byte_fallback
+        if self.mem_writes != None:
+            new_state.mem_writes = self.mem_writes.copy()
         return new_state
+
+    def enable_mem_write_tracking(self):
+        if self.mem_writes == None:
+            self.reset_mem_write_tracking()
+
+    def reset_mem_write_tracking(self):
+        self.mem_writes = defaultdict(TrackedMemWriteAggregator)
 
     def has_constraint(self, constraint: BoolRef) -> bool:
         for cur_constraint in self.constraints:
@@ -277,7 +330,7 @@ class State:
             return self.mem_values[addr]
         else:
             value = self.read_mem_single_byte_uninit(addr)
-            self.write_mem_single_byte(addr, value)
+            self.write_mem_single_byte(addr, value, None)
             return value
 
     def read_multibyte_mem(self, access: MemAccess) -> BitVecRef:
@@ -324,7 +377,7 @@ class State:
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
             self.write_varnode_single_byte(addr, extracted_byte)
 
-    def write_mem_single_byte(self, addr: BitVecRef, value: BitVecRef):
+    def write_mem_single_byte(self, addr: BitVecRef, value: BitVecRef, track_insn_addr: Optional[int]):
         assert value.size() == 8
 
         # simplify the address before trying to access the dictionary.
@@ -332,15 +385,18 @@ class State:
         addr = simplify(addr)
 
         self.mem_values[addr] = value
+
+        if track_insn_addr != None and self.mem_writes != None:
+            self.mem_writes[track_insn_addr].track_write(addr, value)
         
-    def write_mem(self, access: MemAccess, value: BitVecRef):
+    def write_mem(self, access: MemAccess, value: BitVecRef, track_insn_addr: Optional[int]):
         assert value.size() == access.size_in_bytes * BITS_PER_BYTE
         value = simplify(value)
         for rel_byte_off in range(access.size_in_bytes):
             addr = access.addr + rel_byte_off
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
             extracted_byte = Extract(start_bit_offset + 7, start_bit_offset, value)
-            self.write_mem_single_byte(addr, extracted_byte)
+            self.write_mem_single_byte(addr, extracted_byte, track_insn_addr)
 
     def exec_binop(self, op: pypcode.PcodeOp, binary_operation: Callable[[BitVecRef, BitVecRef], BitVecRef]):
         assert len(op.inputs) == 2
@@ -381,7 +437,7 @@ class State:
             b = ZeroExt(a.size() - b.size(), b)
         return a << b
 
-    def exec_pcode_op(self, op: pypcode.PcodeOp):
+    def exec_pcode_op(self, op: pypcode.PcodeOp, insn_addr: int):
         binops = {
             pypcode.OpCode.INT_XOR: lambda a,b: a ^ b,
             pypcode.OpCode.INT_AND: lambda a,b: a & b,
@@ -426,7 +482,7 @@ class State:
             addr = self.read_varnode(op.inputs[1])
             mem_access = MemAccess(addr, op.inputs[2].size)
             result = self.read_varnode(op.inputs[2])
-            self.write_mem(mem_access, result)
+            self.write_mem(mem_access, result, insn_addr)
         elif op.opcode == pypcode.OpCode.SUBPIECE:
             assert len(op.inputs) == 2
             shit_amount_varnode = op.inputs[1]
@@ -522,7 +578,7 @@ class State:
         assert imark_op.opcode == pypcode.OpCode.IMARK
         assert imark_op.inputs[0].offset == code_addr
         next_insn_addr = code_addr + imark_op.inputs[0].size
-        successors = self.exec_pcode_ops(tx.ops, 1, next_insn_addr)
+        successors = self.exec_pcode_ops(tx.ops, 1, code_addr, next_insn_addr)
         for successor in successors:
             successor.state.cleanup_unique_varnodes()
         return successors
@@ -549,7 +605,7 @@ class State:
         # here, we know that the condition is unknown - may be true and may be false.
         return ResolvedCondition.UNKNOWN
 
-    def exec_pcode_ops(self, ops: List[pypcode.Instruction], first_op_index: int, next_insn_addr: int) -> List[Successor]:
+    def exec_pcode_ops(self, ops: List[pypcode.Instruction], first_op_index: int, insn_addr: int, next_insn_addr: int) -> List[Successor]:
         for i, op in itertools.islice(enumerate(ops), first_op_index, None):
             if op.opcode == pypcode.OpCode.IMARK:
                 if i == 0:
@@ -566,7 +622,7 @@ class State:
                     return [Successor(self, BitVecVal(addr, 64), True, False, False)]
                 else:
                     assert addr_varnode.space.name == 'const'
-                    return self.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
+                    return self.exec_pcode_ops(ops, i + addr_varnode.offset, insn_addr, next_insn_addr)
             elif op.opcode == pypcode.OpCode.BRANCHIND:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
@@ -595,7 +651,7 @@ class State:
 
                         # generate the successors for the case where the branch is **not** taken.
                         self.add_constraint(cond_value_expr == 0)
-                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, next_insn_addr)
+                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, insn_addr, next_insn_addr)
                         return branch_not_taken_successors + [branch_taken_successor]
                     else:
                         unreachable()
@@ -607,18 +663,18 @@ class State:
                         continue
                     elif resolved_condition == ResolvedCondition.TRUE:
                         # the branch is taken.
-                        return self.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
+                        return self.exec_pcode_ops(ops, i + addr_varnode.offset, insn_addr, next_insn_addr)
                     elif resolved_condition == ResolvedCondition.UNKNOWN:
                         # here, we know that the condition is unknown - may be true and may be false, so take both branches.
 
                         # generate the successors for the case where the branch is taken.
                         branch_taken_state = self.copy()
                         branch_taken_state.add_constraint(cond_value_expr != 0)
-                        branch_taken_successors = branch_taken_state.exec_pcode_ops(ops, i + addr_varnode.offset, next_insn_addr)
+                        branch_taken_successors = branch_taken_state.exec_pcode_ops(ops, i + addr_varnode.offset, insn_addr, next_insn_addr)
 
                         # generate the successors for the case where the branch is **not** taken.
                         self.add_constraint(cond_value_expr == 0)
-                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, next_insn_addr)
+                        branch_not_taken_successors = self.exec_pcode_ops(ops, i + 1, insn_addr, next_insn_addr)
                         return branch_not_taken_successors + branch_taken_successors
                     else:
                         unreachable()
@@ -628,7 +684,7 @@ class State:
                 addr = self.read_varnode(op.inputs[0])
                 return [Successor(self, addr, True, True, True)]
                 
-            self.exec_pcode_op(op)
+            self.exec_pcode_op(op, insn_addr)
         return [Successor(self, BitVecVal(next_insn_addr, 64), False, False, False)]
 
     def read_single_byte_from_mem_or_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> int:
@@ -647,9 +703,9 @@ class State:
         insn_bytes = bytes(insn_single_bytes)
 
         # debug
-        cs = Cs(CS_ARCH_X86, CS_MODE_64)
-        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
-        print('executing insn {} {} {}'.format(hex(address), insn_mnemonic, insn_op_str))
+        # cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        # insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
+        # print('executing insn {} {} {}'.format(hex(address), insn_mnemonic, insn_op_str))
         # debug
 
         return self.exec_single_insn(insn_bytes, address)
@@ -754,7 +810,7 @@ class SimManager:
     def step(self, opts: StepOptions):
         new_active = ActiveStatesSet()
         for state_index, active_state in enumerate(self.active):
-            print('STEPPING STATE {}'.format(state_index))
+            # print('STEPPING STATE {}'.format(state_index))
             successors = active_state.state.exec_single_insn_from_dump_file(
                 self.dumpfile_reader,
                 active_state.next_insn_addr
@@ -787,14 +843,27 @@ class VmSimManager:
 
         initial_state = State()
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
-        initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec)
+        initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec, None)
+        initial_state.enable_mem_write_tracking()
 
         self.simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
 
     def exec_single_vm_handler(self):
+        for active_state in self.simgr.active:
+            active_state.state.reset_mem_write_tracking()
         self.simgr.run(StepOptions(allow_indirect_branches=False))
         assert len(self.simgr.unconstrained) == 0
         assert len(self.simgr.stopped) > 0
+
+        for i, stopped_state in enumerate(self.simgr.stopped):
+            print('MEM WRITES FOR STATE {}'.format(i))
+            print('===========')
+            for insn_addr, tracked_write in stopped_state.state.mem_writes.items():
+                print('INSN {}'.format(get_insn_disassembly(insn_addr)))
+                print('ADDR = {}'.format(tracked_write.addr))
+                print('VALUE = {}'.format(tracked_write.value))
+                print()
+            print('===========')
 
         # re-activate the stopped states
         self.simgr.active = self.simgr.stopped
@@ -814,7 +883,7 @@ def try_read_dump_byte(addr: int) -> Optional[int]:
     
 def get_vm_entrypoint_final_state(pushed_magic: BitVec) -> UnconstrainedState:
     initial_state = State()
-    initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic)
+    initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic, None)
     simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
     simgr.run(StepOptions(True))
     assert len(simgr.unconstrained) == 1
