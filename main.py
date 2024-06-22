@@ -49,6 +49,12 @@ class Successor:
     is_return: bool
     is_indirect_branch: bool
 
+@dataclass
+class StateDiff:
+    varnode_addrs: List[VarnodeAddr]
+    mem_addrs: List[BitVecRef]
+    constraints: List[BoolRef]
+
 class ResolvedCondition(enum.Enum):
     FALSE = 0
     TRUE = 1
@@ -120,6 +126,35 @@ class State:
             if other.has_constraint(self_constraint):
                 res.append(self_constraint)
         return res
+
+    def diff(self, other: State) -> StateDiff:
+        diff_varnode_addrs = []
+        diff_mem_addrs = []
+        diff_constraints = []
+        for k in self.varnode_values.keys():
+            if k not in other.varnode_values or not are_concretely_equal(EMPTY_SOLVER, self.varnode_values[k], other.varnode_values[k]):
+                diff_varnode_addrs.append(k)
+        for k in other.varnode_values.keys():
+            if k in self.varnode_values:
+                # already considered this key, because we considered all keys in `self.varnode_values`.
+                continue
+            diff_varnode_addrs.append(k)
+
+        for k in self.mem_values.keys():
+            if k not in other.mem_values or not are_concretely_equal(EMPTY_SOLVER, self.mem_values[k], other.mem_values[k]):
+                diff_mem_addrs.append(k)
+        for k in other.mem_values.keys():
+            if k in self.mem_values:
+                # already considered this key, because we considered all keys in `self.mem_values`.
+                continue
+            diff_mem_addrs.append(k)
+        for c in self.constraints:
+            if not other.has_constraint(c):
+                diff_constraints.append(c)
+        for c in other.constraints:
+            if not self.has_constraint(c):
+                diff_constraints.append(c)
+        return StateDiff(diff_varnode_addrs, diff_mem_addrs, diff_constraints)
 
     def is_same_as(self, other: State) -> bool:
         """
