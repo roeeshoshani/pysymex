@@ -137,6 +137,47 @@ def simplify_concat_extract(solver: Solver, single_byte_values: List[BitVecRef])
         return simplify_concat_extract(solver, new_values)
     return single_byte_values
 
+def extract_cond_from_int_cond(int_cond: BitVecRef) -> Optional[BoolRef]:
+    concrete_int_cond = try_expr_to_concrete(int_cond)
+    if concrete_int_cond != None:
+        if concrete_int_cond != 0:
+            return BoolVal(True)
+        else:
+            return BoolVal(False)
+    if int_cond.decl().name().lower() != 'if':
+        return None
+    if int_cond.num_args() != 3:
+        return None
+
+    if (
+        are_concretely_equal(
+            EMPTY_SOLVER, int_cond.arg(1), BitVecVal(1, 8)
+        ) and are_concretely_equal(
+            EMPTY_SOLVER, int_cond.arg(2), BitVecVal(0, 8)
+        )
+    ):
+        # the condition is not negated
+        cond = int_cond.arg(0)
+        assert isinstance(cond, BoolRef)
+        return cond
+
+    elif (
+        are_concretely_equal(
+            EMPTY_SOLVER, int_cond.arg(1), BitVecVal(0, 8)
+        ) and are_concretely_equal(
+            EMPTY_SOLVER, int_cond.arg(2), BitVecVal(1, 8)
+        )
+    ):
+        # the condition is negated
+        cond = int_cond.arg(0)
+        assert isinstance(cond, BoolRef)
+        return Not(cond)
+    return None
+
+def build_int_cond_from_cond(cond: BoolRef) -> BitVecRef:
+    cond = simplify(cond)
+    return If(cond, BitVecVal(1, 8), BitVecVal(0, 8))
+
 class State:
     def __init__(self):
         self.ctx = pypcode.Context("x86:LE:64:default")
@@ -405,13 +446,21 @@ class State:
         result = binary_operation(input_a, input_b)
         self.write_varnode(op.output, result)
 
+    def exec_bool_binop(self, op: pypcode.PcodeOp, binary_operation: Callable[[BoolRef, BoolRef], BoolRef]):
+        assert len(op.inputs) == 2
+        input_a = self.read_varnode(op.inputs[0])
+        input_b = self.read_varnode(op.inputs[1])
+        cond_a = extract_cond_from_int_cond(input_a)
+        cond_b = extract_cond_from_int_cond(input_b)
+        result_cond = binary_operation(cond_a, cond_b)
+        self.write_varnode(op.output, build_int_cond_from_cond(result_cond))
+
     def exec_comparison(self, op: pypcode.PcodeOp, comparison_operation: Callable[[BitVecRef, BitVecRef], BoolRef]):
         assert len(op.inputs) == 2
         input_a = self.read_varnode(op.inputs[0])
         input_b = self.read_varnode(op.inputs[1])
         cond = comparison_operation(input_a, input_b)
-        result = If(cond, BitVecVal(1, 8), BitVecVal(0, 8))
-        self.write_varnode(op.output, result)
+        self.write_varnode(op.output, build_int_cond_from_cond(cond))
 
     @staticmethod
     def shift_right(a: BitVecRef, b: BitVecRef) -> BitVecRef:
@@ -449,9 +498,11 @@ class State:
             pypcode.OpCode.INT_RIGHT: State.shift_right,
             pypcode.OpCode.INT_SRIGHT: State.signed_shift_right,
             pypcode.OpCode.INT_LEFT: State.shift_left,
-            pypcode.OpCode.BOOL_OR: lambda a,b: a | b,
-            pypcode.OpCode.BOOL_XOR: lambda a,b: a ^ b,
-            pypcode.OpCode.BOOL_AND: lambda a,b: a & b,
+        }
+        bool_binops = {
+            pypcode.OpCode.BOOL_OR: Or,
+            pypcode.OpCode.BOOL_XOR: Xor,
+            pypcode.OpCode.BOOL_AND: And,
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
@@ -526,11 +577,15 @@ class State:
         elif op.opcode == pypcode.OpCode.BOOL_NEGATE:
             assert len(op.inputs) == 1
             value = self.read_varnode(op.inputs[0])
-            result = If(value == 0, BitVecVal(1, 8), BitVecVal(0, 8))
-            self.write_varnode(op.output, result)
+            cond = extract_cond_from_int_cond(value)
+            assert cond != None, 'cant extract condition from int cond {}'.format(value)
+            self.write_varnode(op.output, build_int_cond_from_cond(Not(cond)))
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
+        elif op.opcode in bool_binops:
+            bool_binop = bool_binops[op.opcode]
+            self.exec_bool_binop(op, bool_binop)
         elif op.opcode in comparisons:
             comparison = comparisons[op.opcode]
             self.exec_comparison(op, comparison)
@@ -643,6 +698,11 @@ class State:
                         return [Successor(self, BitVecVal(addr, 64), True, False, False)]
                     elif resolved_condition == ResolvedCondition.UNKNOWN:
                         # here, we know that the condition is unknown - may be true and may be false, so take both branches.
+                        print('UNKNOWN COND:')
+                        print('***')
+                        print('R8 = {}'.format(self.regs.r8))
+                        print(extract_cond_from_int_cond(cond_value_expr))
+                        print('***')
 
                         # generate the successor for the case where the branch is taken.
                         branch_taken_state = self.copy()
@@ -942,7 +1002,7 @@ def explore_ep_final_state():
 
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    for i in range(20):
+    for i in range(22):
         vm_simgr.exec_single_vm_handler()
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
