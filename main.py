@@ -742,6 +742,7 @@ class SimManager:
         self.dumpfile_reader = dumpfile_reader
         self.active = [ActiveState(initial_state, first_insn_addr)]
         self.unconstrained = []
+        self.stopped = []
 
     def run(self, opts: StepOptions):
         while not self.finished():
@@ -766,12 +767,16 @@ class SimManager:
                     new_state = new_state.copy()
 
                 next_insn_addr_concrete = try_expr_to_concrete(successor.next_insn_addr)
-                if next_insn_addr_concrete == None or (successor.is_indirect_branch and not opts.allow_indirect_branches):
+                if next_insn_addr_concrete == None:
                     # next address is unconstrained, or this successor is an indirect branch and indirect branches are not allowed
                     self.unconstrained.append(UnconstrainedState(new_state, successor.next_insn_addr))
                 else:
                     # next address is concrete
-                    new_active.append_state(ActiveState(new_state, next_insn_addr_concrete))
+                    new_active_state = ActiveState(new_state, next_insn_addr_concrete)
+                    if successor.is_indirect_branch and not opts.allow_indirect_branches:
+                        self.stopped.append(new_active_state)
+                    else:
+                        new_active.append_state(new_active_state)
         self.active = new_active.states
 
 class VmSimManager:
@@ -784,20 +789,16 @@ class VmSimManager:
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
         initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec)
 
-        self.cur_state = initial_state
-        self.next_handler_addr = VIRT_ENTRY_POINT_ADDR
+        self.simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
 
     def exec_single_vm_handler(self):
-        simgr = SimManager(DUMP_READER, self.cur_state, self.next_handler_addr)
-        simgr.run(StepOptions(False))
-        # if len(simgr.unconstrained) > 1:
-        #     print('MULTIPLE STATES')
-        #     embed()
-        assert len(simgr.unconstrained) > 0
-        final_state = simgr.unconstrained[0]
-        self.cur_state = final_state.state
-        next_handler_addr_expr = final_state.next_insn_addr
-        self.next_handler_addr = expr_to_concrete(next_handler_addr_expr)
+        self.simgr.run(StepOptions(allow_indirect_branches=False))
+        assert len(self.simgr.unconstrained) == 0
+        assert len(self.simgr.stopped) > 0
+
+        # re-activate the stopped states
+        self.simgr.active = self.simgr.stopped
+        self.simgr.stopped = []
 
 def read_dump_byte(addr: int) -> int:
     return DUMP_READER.read(addr, 1)[0]
@@ -867,20 +868,10 @@ def explore_ep_final_state():
     print(r9)
 
 def shit():
-    pushed_magic_value_bitvec = BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)
-
-    initial_state = State()
-    initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
-    initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), pushed_magic_value_bitvec)
-
-    simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
-    simgr.run(StepOptions(True))
-    embed()
-
-    # vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
-    # while True:
-    #     vm_simgr.exec_single_vm_handler()
-    #     print(hex(vm_simgr.next_handler_addr))
+    vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+    for i in range(4):
+        print('INSN')
+        vm_simgr.exec_single_vm_handler()
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
     # final_state = get_vm_handler_final_state(handler_addr)
