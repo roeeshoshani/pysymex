@@ -81,6 +81,10 @@ class TrackedMemWriteAggregator:
         self.single_byte_values = [value] + self.single_byte_values
 
     @property
+    def size_in_bytes(self) -> int:
+        return len(self.single_byte_values)
+
+    @property
     def value(self) -> Optional[BitVecRef]:
         if self.addr is None:
             return None
@@ -113,6 +117,9 @@ def are_concretely_equal(solver: Solver, a: BitVecRef, b: BitVecRef) -> bool:
     if a.size() != b.size():
         return False
     return solver.check(a != b) == unsat
+
+def is_concretely_unsigned_lower_or_eq_to(solver: Solver, a: BitVecRef, b: BitVecRef) -> bool:
+    return solver.check(UGT(a, b)) == unsat
 
 def are_constraints_concretely_equal(solver: Solver, a: BoolRef, b: BoolRef) -> bool:
     return solver.check(a != b) == unsat
@@ -919,23 +926,23 @@ class VmSimManager:
     def exec_single_vm_handler(self):
         for i, active_state in enumerate(self.simgr.active):
             active_state.state.reset_mem_write_tracking()
-            print('ABOUT TO STEP STATE {} STARTING AT ADDR {}'.format(i, hex(active_state.next_insn_addr)))
+            # print('ABOUT TO STEP STATE {} STARTING AT ADDR {}'.format(i, hex(active_state.next_insn_addr)))
         self.simgr.run(StepOptions(allow_indirect_branches=False))
         assert len(self.simgr.unconstrained) == 0
         assert len(self.simgr.stopped) > 0
 
-        for i, stopped_state in enumerate(self.simgr.stopped):
-            print('MEM WRITES FOR STATE {}'.format(i))
-            print('===========')
-            for insn_addr, tracked_write in stopped_state.state.mem_writes.items():
-                print('INSN {}'.format(get_insn_disassembly(insn_addr)))
-                print('ADDR = {}'.format(tracked_write.addr))
-                print('VALUE = {}'.format(tracked_write.value))
-                print()
-            print('===========')
+        # for i, stopped_state in enumerate(self.simgr.stopped):
+        #     print('MEM WRITES FOR STATE {}'.format(i))
+        #     print('===========')
+        #     for insn_addr, tracked_write in stopped_state.state.mem_writes.items():
+        #         print('INSN {}'.format(get_insn_disassembly(insn_addr)))
+        #         print('ADDR = {}'.format(tracked_write.addr))
+        #         print('VALUE = {}'.format(tracked_write.value))
+        #         print()
+        #     print('===========')
 
-        print()
-        print()
+        # print()
+        # print()
 
         # re-activate the stopped states
         self.simgr.active = self.simgr.stopped
@@ -1008,10 +1015,119 @@ def explore_ep_final_state():
     r9 = final_state.state.substitute(final_state.state.regs.r9, read_dump_byte, (pushed_magic, BitVecVal(EXAMPLE_PUSHED_MAGIC, 64)))
     print(r9)
 
+def decode_vm_insn_find_relevant_writes(final_state: State) -> List[TrackedMemWriteAggregator]:
+    result = []
+    for insn_addr, write in final_state.mem_writes.items():
+        write_end_addr = simplify(write.addr + write.size_in_bytes)
+        if is_concretely_unsigned_lower_or_eq_to(final_state.solver, write_end_addr, final_state.regs.rsp):
+            # if the end address of the write is below (or equal to) rsp, then the write is no longer relevant.
+            continue
+        result.append(write)
+    return result
+
+class VmInsnWriteTarget(enum.Enum):
+    VM_STATE_REG = 1
+
+class VmInsnWrittenValue(enum.Enum):
+    VM_TOP_OF_STACK = 1
+
+def are_lists_concretely_equal_regardless_of_order(solver: Solver, a: List[BitVecRef], b: List[BitVecRef]) -> bool:
+    if len(a) != len(b):
+        return False
+    b = b.copy()
+    for a_item in a:
+        found = False
+        for b_index in range(len(b)):
+            if are_concretely_equal(solver, a_item, b[b_index]):
+                found = True
+                del b[b_index]
+                break
+        if not found:
+            return False
+    return True
+
+def decode_vm_insn_write_target(write: TrackedMemWriteAggregator) -> VmInsnWriteTarget:
+    write_addr_vars = z3util.get_vars(write.addr)
+    if are_lists_concretely_equal_regardless_of_order(
+        EMPTY_SOLVER,
+        write_addr_vars,
+        [BitVec('vm_state_ptr', 64), BitVec('code_byte_0', 8), BitVec('vm_checksum_accumulator', 64)]
+    ):
+        return VmInsnWriteTarget.VM_STATE_REG
+    else:
+        assert False, 'unknown insn write target, write addr = {}'.format(write.addr)
+
+def decode_vm_insn_written_value(write: TrackedMemWriteAggregator) -> VmInsnWrittenValue:
+    value = write.value
+    value_vars = z3util.get_vars(value)
+    if value == BitVec('vm_stack_0', 64):
+        return VmInsnWrittenValue.VM_TOP_OF_STACK
+    else:
+        assert False, 'unknown insn written value, value = {}'.format(value)
+
+def decode_vm_insn(vm_handler_addr: int):
+    initial_state = State()
+    initial_state.regs.rbx = BitVecVal(vm_handler_addr, 64)
+    initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
+    vm_state_ptr = BitVec('vm_state_ptr', 64)
+    initial_state.regs.rsp = vm_state_ptr
+
+    # some conditions can have weird results if `rsp` is close to one of the ends of the address space,
+    # so make sure that it isn't.
+    rsp_distance_from_ends_of_address_space = 0x16000
+    min_rsp = rsp_distance_from_ends_of_address_space
+    max_rsp = 2**64 - rsp_distance_from_ends_of_address_space
+    initial_state.add_constraint(UGE(initial_state.regs.rsp, BitVecVal(min_rsp, 64)))
+    initial_state.add_constraint(ULT(initial_state.regs.rsp, BitVecVal(max_rsp, 64)))
+
+    vm_state_size = 0x100
+    for reg_offset in range(0, vm_state_size, 8):
+        initial_state.write_mem(MemAccess(initial_state.regs.rsp + reg_offset, 8), BitVec('vm_reg_{}'.format(reg_offset), 64), None)
+
+    vm_stack_ptr = BitVec('vm_stack_ptr', 64)
+    initial_state.regs.r8 = vm_stack_ptr
+
+    stack_vars_amount = 16
+    for stack_off in range(0, 8*stack_vars_amount, 8):
+        initial_state.write_mem(MemAccess(initial_state.regs.r8 + stack_off, 8), BitVec('vm_stack_{}'.format(stack_off), 64), None)
+
+    vm_checksum_accumulator = BitVec('vm_checksum_accumulator', 64)
+    initial_state.regs.r9 = vm_checksum_accumulator
+
+    vm_ip = BitVec('vm_ip', 64)
+    initial_state.regs.r10 = vm_ip
+
+    max_insn_size = 64
+    for stack_off in range(max_insn_size):
+        initial_state.write_mem(MemAccess(initial_state.regs.r10 + stack_off, 1), BitVec('code_byte_{}'.format(stack_off), 8), None)
+
+    initial_state.enable_mem_write_tracking()
+
+    simgr = SimManager(DUMP_READER, initial_state, vm_handler_addr)
+    simgr.run(StepOptions(False))
+    assert len(simgr.unconstrained) == 1
+    assert len(simgr.stopped) == 0
+    final_state = simgr.unconstrained[0].state
+    relevant_writes = decode_vm_insn_find_relevant_writes(final_state)
+    if (
+        len(relevant_writes) == 1 and
+        decode_vm_insn_write_target(relevant_writes[0]) == VmInsnWriteTarget.VM_STATE_REG and
+        decode_vm_insn_written_value(relevant_writes[0]) == VmInsnWrittenValue.VM_TOP_OF_STACK
+    ):
+        print('POP <REG>')
+    else:
+        assert False, 'failed to decode vm instruction'
+
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+    # run the vm entry handler
+    vm_simgr.exec_single_vm_handler()
     for i in range(28):
+        assert len(vm_simgr.simgr.active) == 1
+        decode_vm_insn(vm_simgr.simgr.active[0].next_insn_addr)
         vm_simgr.exec_single_vm_handler()
+
+    # decode_vm_insn(0xce79b8)
 
     # handler_addr = get_vm_first_handler_addr(EXAMPLE_PUSHED_MAGIC)
     # final_state = get_vm_handler_final_state(handler_addr)
