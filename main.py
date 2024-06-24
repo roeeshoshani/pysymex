@@ -10,6 +10,7 @@ from collections import defaultdict
 import pypcode
 import itertools
 import enum
+import time
 
 BITS_PER_BYTE = 8
 DUMP_FILE_PATH = '/home/sho/Documents/freelance/getcode/GetCode.DMP'
@@ -144,7 +145,7 @@ def simplify_concat_extract(solver: Solver, single_byte_values: List[BitVecRef])
         return simplify_concat_extract(solver, new_values)
     return single_byte_values
 
-def extract_cond_from_int_cond(int_cond: BitVecRef) -> Optional[BoolRef]:
+def try_extract_cond_from_int_cond(int_cond: BitVecRef) -> Optional[BoolRef]:
     concrete_int_cond = try_expr_to_concrete(int_cond)
     if concrete_int_cond != None:
         if concrete_int_cond != 0:
@@ -453,14 +454,21 @@ class State:
         result = binary_operation(input_a, input_b)
         self.write_varnode(op.output, result)
 
-    def exec_bool_binop(self, op: pypcode.PcodeOp, binary_operation: Callable[[BoolRef, BoolRef], BoolRef]):
+    def exec_bool_binop(self,
+        op: pypcode.PcodeOp,
+        binary_operation: Callable[[BoolRef, BoolRef], BoolRef],
+        int_binary_operation: Callable[[BitVecRef, BitVecRef], BitVecRef]
+    ):
         assert len(op.inputs) == 2
         input_a = self.read_varnode(op.inputs[0])
         input_b = self.read_varnode(op.inputs[1])
-        cond_a = extract_cond_from_int_cond(input_a)
-        cond_b = extract_cond_from_int_cond(input_b)
-        result_cond = binary_operation(cond_a, cond_b)
-        self.write_varnode(op.output, build_int_cond_from_cond(result_cond))
+        cond_a = try_extract_cond_from_int_cond(input_a)
+        cond_b = try_extract_cond_from_int_cond(input_b)
+        if cond_a != None and cond_b != None:
+            result_cond = binary_operation(cond_a, cond_b)
+            self.write_varnode(op.output, build_int_cond_from_cond(result_cond))
+        else:
+            self.write_varnode(op.output, int_binary_operation(input_a, input_b))
 
     def exec_comparison(self, op: pypcode.PcodeOp, comparison_operation: Callable[[BitVecRef, BitVecRef], BoolRef]):
         assert len(op.inputs) == 2
@@ -507,9 +515,9 @@ class State:
             pypcode.OpCode.INT_LEFT: State.shift_left,
         }
         bool_binops = {
-            pypcode.OpCode.BOOL_OR: Or,
-            pypcode.OpCode.BOOL_XOR: Xor,
-            pypcode.OpCode.BOOL_AND: And,
+            pypcode.OpCode.BOOL_OR: (Or, lambda a,b: a|b),
+            pypcode.OpCode.BOOL_XOR: (Xor, lambda a,b: a^b),
+            pypcode.OpCode.BOOL_AND: (And, lambda a,b: a&b),
         }
         comparisons = {
             pypcode.OpCode.INT_SLESS: lambda a,b: a < b,
@@ -584,15 +592,27 @@ class State:
         elif op.opcode == pypcode.OpCode.BOOL_NEGATE:
             assert len(op.inputs) == 1
             value = self.read_varnode(op.inputs[0])
-            cond = extract_cond_from_int_cond(value)
-            assert cond != None, 'cant extract condition from int cond {}'.format(value)
-            self.write_varnode(op.output, build_int_cond_from_cond(Not(cond)))
+            cond = try_extract_cond_from_int_cond(value)
+            if cond != None:
+                self.write_varnode(op.output, build_int_cond_from_cond(Not(cond)))
+            else:
+                self.write_varnode(op.output, build_int_cond_from_cond(value == 0))
+        elif op.opcode == pypcode.OpCode.CALLOTHER:
+            assert len(op.inputs) >= 1
+            assert op.inputs[0].space.name == 'const'
+            index = op.inputs[0].offset
+            if index == 74:
+                # rdtsc
+                assert len(op.inputs) == 1
+                self.write_varnode(op.output, BitVec('rdtsc_{}'.format(time.time()), 64))
+            else:
+                raise Exception('unknown CALLOTHER index {}'.format(index))
         elif op.opcode in binops:
             binop = binops[op.opcode]
             self.exec_binop(op, binop)
         elif op.opcode in bool_binops:
-            bool_binop = bool_binops[op.opcode]
-            self.exec_bool_binop(op, bool_binop)
+            (bool_binop, int_binop)  = bool_binops[op.opcode]
+            self.exec_bool_binop(op, bool_binop, int_binop)
         elif op.opcode in comparisons:
             comparison = comparisons[op.opcode]
             self.exec_comparison(op, comparison)
@@ -665,6 +685,7 @@ class State:
             return ResolvedCondition.TRUE
 
         # here, we know that the condition is unknown - may be true and may be false.
+        print('UNKNOWN CONDITION {}'.format(cond_value_expr))
         return ResolvedCondition.UNKNOWN
 
     def exec_pcode_ops(self, ops: List[pypcode.Instruction], first_op_index: int, insn_addr: int, next_insn_addr: int) -> List[Successor]:
@@ -708,7 +729,7 @@ class State:
                         print('UNKNOWN COND:')
                         print('***')
                         print('R8 = {}'.format(self.regs.r8))
-                        print(extract_cond_from_int_cond(cond_value_expr))
+                        print(try_extract_cond_from_int_cond(cond_value_expr))
                         print('***')
 
                         # generate the successor for the case where the branch is taken.
@@ -770,9 +791,9 @@ class State:
         insn_bytes = bytes(insn_single_bytes)
 
         # debug
-        # cs = Cs(CS_ARCH_X86, CS_MODE_64)
-        # insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
-        # print('executing insn {} {} {}'.format(hex(address), insn_mnemonic, insn_op_str))
+        cs = Cs(CS_ARCH_X86, CS_MODE_64)
+        insn_addr, insn_size, insn_mnemonic, insn_op_str = next(cs.disasm_lite(insn_bytes, address))
+        print('executing insn {} {} {}'.format(hex(address), insn_mnemonic, insn_op_str))
         # debug
 
         return self.exec_single_insn(insn_bytes, address)
@@ -919,7 +940,6 @@ class VmSimManager:
         max_rsp = 2**64 - rsp_distance_from_ends_of_address_space
         initial_state.add_constraint(UGE(initial_state.regs.rsp, BitVecVal(min_rsp, 64)))
         initial_state.add_constraint(ULT(initial_state.regs.rsp, BitVecVal(max_rsp, 64)))
-        initial_state.enable_mem_write_tracking()
 
         self.simgr = SimManager(DUMP_READER, initial_state, VIRT_ENTRY_POINT_ADDR)
 
@@ -1120,12 +1140,13 @@ def decode_vm_insn(vm_handler_addr: int):
 
 def shit():
     vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+    vm_simgr.simgr.run(StepOptions(allow_indirect_branches=True))
     # run the vm entry handler
-    vm_simgr.exec_single_vm_handler()
-    for i in range(28):
-        assert len(vm_simgr.simgr.active) == 1
-        decode_vm_insn(vm_simgr.simgr.active[0].next_insn_addr)
-        vm_simgr.exec_single_vm_handler()
+    # vm_simgr.exec_single_vm_handler()
+    # for i in range(28):
+    #     assert len(vm_simgr.simgr.active) == 1
+    #     decode_vm_insn(vm_simgr.simgr.active[0].next_insn_addr)
+    #     vm_simgr.exec_single_vm_handler()
 
     # decode_vm_insn(0xce79b8)
 
