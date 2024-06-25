@@ -92,15 +92,25 @@ class TrackedMemWriteAggregator:
         single_byte_values = simplify_concat_extract(EMPTY_SOLVER, self.single_byte_values)
 
         if len(single_byte_values) == 1:
-            return simplify(single_byte_values[0])
+            return remove_redundant_vars(EMPTY_SOLVER, simplify(single_byte_values[0]))
         else:
-            return simplify(Concat(single_byte_values))
+            return remove_redundant_vars(EMPTY_SOLVER, simplify(Concat(single_byte_values)))
 
     def __repr__(self) -> str:
         return 'TrackedMemWriteAggregator(addr={}, value={})'.format(self.addr, self.value)
 
     def __str__(self) -> str:
         return repr(self)
+
+def remove_redundant_vars(solver: Solver, expr: BitVecRef) -> BitVecRef:
+    expr_vars = z3util.get_vars(expr)
+    redundant_vars = []
+    resulting_expr = expr
+    for var in expr_vars:
+        subbed = substitute(expr, (var, BitVecVal(0, var.size())))
+        if solver.check(ForAll(expr_vars, expr == subbed)) == sat:
+            resulting_expr = substitute(resulting_expr, (var, BitVecVal(0, var.size())))
+    return simplify(resulting_expr)
 
 def get_insn_disassembly(address: int) -> str:
     insn_bytes = DUMP_READER.read(address, X86_MAX_INSN_LEN)
@@ -355,7 +365,7 @@ class State:
         if varnode.space.name == 'const':
             return BitVecVal(varnode.offset, varnode.size * BITS_PER_BYTE)
         else:
-            return simplify(self.read_non_const_varnode(varnode))
+            return remove_redundant_vars(self.solver, simplify(self.read_non_const_varnode(varnode)))
 
     def read_mem_single_byte_uninit(self, addr: BitVecRef) -> BitVecRef:
         # if the address is concrete, try using the fallback function
@@ -374,7 +384,7 @@ class State:
     def read_mem_single_byte(self, addr: BitVecRef) -> BitVecRef:
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
-        addr = simplify(addr)
+        addr = remove_redundant_vars(self.solver, simplify(addr))
         if addr in self.mem_values:
             return self.mem_values[addr]
         else:
@@ -400,7 +410,7 @@ class State:
             return self.read_mem_single_byte(access.addr)
         else:
             # multi byte
-            return simplify(self.read_multibyte_mem(access))
+            return remove_redundant_vars(self.solver, simplify(self.read_multibyte_mem(access)))
 
     def was_entire_mem_written_to(self, access: MemAccess) -> BitVecRef:
         single_byte_values = []
@@ -408,7 +418,7 @@ class State:
             addr = access.addr + rel_byte_off
             # simplify the address before trying to access the dictionary.
             # this is important since simplification makes the expression deterministic.
-            addr = simplify(addr)
+            addr = remove_redundant_vars(self.solver, simplify(addr))
             if addr not in self.mem_values:
                 return False
         return True
@@ -419,7 +429,7 @@ class State:
         
     def write_varnode(self, varnode: pypcode.Varnode, value: BitVecRef):
         assert value.size() == varnode.size * BITS_PER_BYTE
-        value = simplify(value)
+        value = remove_redundant_vars(self.solver, simplify(value))
         for rel_byte_off in range(varnode.size):
             addr = VarnodeAddr(varnode.space.name, varnode.offset + rel_byte_off)
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
@@ -431,7 +441,7 @@ class State:
 
         # simplify the address before trying to access the dictionary.
         # this is important since simplification makes the expression deterministic.
-        addr = simplify(addr)
+        addr = remove_redundant_vars(self.solver, simplify(addr))
 
         self.mem_values[addr] = value
 
@@ -440,7 +450,7 @@ class State:
         
     def write_mem(self, access: MemAccess, value: BitVecRef, track_insn_addr: Optional[int]):
         assert value.size() == access.size_in_bytes * BITS_PER_BYTE
-        value = simplify(value)
+        value = remove_redundant_vars(self.solver, simplify(value))
         for rel_byte_off in range(access.size_in_bytes):
             addr = access.addr + rel_byte_off
             start_bit_offset = rel_byte_off * BITS_PER_BYTE
@@ -641,7 +651,7 @@ class State:
             if not did_anything:
                 break
 
-        expr = simplify(expr)
+        expr = remove_redundant_vars(self.solver, simplify(expr))
         return expr
 
     def cleanup_unique_varnodes(self):
@@ -933,15 +943,15 @@ class VmSimManager:
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
         initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec, None)
 
-        initial_state.regs.nt = BitVecVal(0, 8)
-        initial_state.regs.df = BitVecVal(0, 8)
-        setattr(initial_state.regs, 'if', BitVecVal(1, 8))
-        initial_state.regs.tf = BitVecVal(0, 8)
-        initial_state.regs.af = BitVecVal(0, 8)
-        initial_state.regs.id = BitVecVal(1, 8)
-        initial_state.regs.ac = BitVecVal(0, 8)
-        initial_state.regs.vip = BitVecVal(0, 8)
-        initial_state.regs.vif = BitVecVal(0, 8)
+        # initial_state.regs.nt = BitVecVal(0, 8)
+        # initial_state.regs.df = BitVecVal(0, 8)
+        # setattr(initial_state.regs, 'if', BitVecVal(1, 8))
+        # initial_state.regs.tf = BitVecVal(0, 8)
+        # initial_state.regs.af = BitVecVal(0, 8)
+        # initial_state.regs.id = BitVecVal(1, 8)
+        # initial_state.regs.ac = BitVecVal(0, 8)
+        # initial_state.regs.vip = BitVecVal(0, 8)
+        # initial_state.regs.vif = BitVecVal(0, 8)
 
         # some conditions can have weird results if `rsp` is close to one of the ends of the address space,
         # so make sure that it isn't.
