@@ -933,6 +933,8 @@ class VmSimManager:
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
         initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec, None)
 
+        initial_state.regs.eflags = BitVecVal(0x200246, 32)
+
         # some conditions can have weird results if `rsp` is close to one of the ends of the address space,
         # so make sure that it isn't.
         rsp_distance_from_ends_of_address_space = 0x16000
