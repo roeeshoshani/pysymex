@@ -777,12 +777,12 @@ class State:
 
     def read_single_byte_from_mem_or_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> int:
         addr_bitvec = BitVecVal(address, 64)
+        dumpfile_byte_value = dumpfile_reader.read(address, 1)[0]
         if addr_bitvec in self.mem_values:
-            raise Exception('self modifying code')
-            # expr = self.read_mem(self.mem_values[addr_bitvec])
-            # return expr_to_concrete(expr)
-        else:
-            return dumpfile_reader.read(address, 1)[0]
+            byte_value = self.mem_values[addr_bitvec]
+            if not are_concretely_equal(EMPTY_SOLVER, byte_value, BitVecVal(dumpfile_byte_value, 8)):
+                raise Exception('self modifying code while reading from address {}'.format(hex(address)))
+        return dumpfile_byte_value
 
     def exec_single_insn_from_dump_file(self, dumpfile_reader: MinidumpFileReader, address: int) -> List[Successor]:
         insn_single_bytes = []
@@ -933,7 +933,15 @@ class VmSimManager:
         initial_state.set_read_mem_single_byte_fallback(read_dump_byte)
         initial_state.write_mem(MemAccess(initial_state.regs.rsp + 8, 8), self.pushed_magic_value_bitvec, None)
 
-        initial_state.regs.eflags = BitVecVal(0x200246, 32)
+        initial_state.regs.nt = BitVecVal(0, 8)
+        initial_state.regs.df = BitVecVal(0, 8)
+        setattr(initial_state.regs, 'if', BitVecVal(1, 8))
+        initial_state.regs.tf = BitVecVal(0, 8)
+        initial_state.regs.af = BitVecVal(0, 8)
+        initial_state.regs.id = BitVecVal(1, 8)
+        initial_state.regs.ac = BitVecVal(0, 8)
+        initial_state.regs.vip = BitVecVal(0, 8)
+        initial_state.regs.vif = BitVecVal(0, 8)
 
         # some conditions can have weird results if `rsp` is close to one of the ends of the address space,
         # so make sure that it isn't.
