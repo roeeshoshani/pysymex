@@ -697,7 +697,7 @@ class State:
                 else:
                     # reached a second IMARK, so this is no longer the first instruction. stop executing.
                     break
-            elif op.opcode == pypcode.OpCode.BRANCH:
+            elif op.opcode == pypcode.OpCode.BRANCH or op.opcode == pypcode.OpCode.CALL:
                 assert len(op.inputs) == 1
                 addr_varnode = op.inputs[0]
                 if addr_varnode.space.name == 'ram':
@@ -706,7 +706,7 @@ class State:
                 else:
                     assert addr_varnode.space.name == 'const'
                     return self.exec_pcode_ops(ops, i + addr_varnode.offset, insn_addr, next_insn_addr)
-            elif op.opcode == pypcode.OpCode.BRANCHIND:
+            elif op.opcode == pypcode.OpCode.BRANCHIND or op.opcode == pypcode.OpCode.CALLIND:
                 assert len(op.inputs) == 1
                 addr = self.read_varnode(op.inputs[0])
                 return [Successor(self, addr, True, False, True)]
