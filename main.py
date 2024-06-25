@@ -1160,4 +1160,7 @@ def main():
     # explore_ep_final_state()
     # calculate_vm_state_structure()
 
-main()
+# main()
+
+vm_simgr = VmSimManager(EXAMPLE_PUSHED_MAGIC)
+vm_simgr.simgr.run(StepOptions(allow_indirect_branches=True))
